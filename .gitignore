@@ -1,0 +1,30 @@
+# Data
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+.pdf
+
+# Custom
+verify_config.py
+update_notebook.py
+update_notebooks_dist.py
+test_distribution.py
+test_implementation.py
+test_multi_seed_logic.py
