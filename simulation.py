@@ -14,11 +14,13 @@ from data import PoisonedDataset
 ClientState = Dict[str, Dict]  # {'head': state_dict, 'tail': state_dict}
 
 class Client:
-    def __init__(self, client_id, dataset, device="cpu", poison_fraction=0.0, target_label=0, dataset_name='mnist', lr=0.01, momentum=0.9, batch_size=32):
+    def __init__(self, client_id, dataset, device="cpu", poison_fraction=0.0, target_label=0, dataset_name='mnist', lr=0.01, momentum=0.9, batch_size=32, attack_type='backdoor', source_labels=None):
         self.client_id = client_id
         self.device = device
         self.dataset = dataset
         self.dataset_name = dataset_name # Store for poisoning logic if needed later
+        self.attack_type = attack_type
+        self.source_labels = source_labels
 
         # Use factory to get models. Server backbone will be created separately but must match.
         # We only need Head and Tail here.
@@ -31,7 +33,7 @@ class Client:
 
         self.is_malicious = poison_fraction > 0
         if self.is_malicious:
-            self.dataset = PoisonedDataset(dataset, target_label, poison_fraction, mode="train", dataset_name=dataset_name)
+            self.dataset = PoisonedDataset(dataset, target_label, poison_fraction, mode="train", dataset_name=dataset_name, attack_type=attack_type, source_labels=source_labels)
 
         self.dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
 
@@ -162,6 +164,11 @@ def run_simulation(config):
     poison_ratio = config.get("poison_ratio", 0.0)
     dataset_name = config.get("dataset", "mnist").lower() # New config param
     
+    # Attack Config
+    attack_type = config.get("attack_type", "backdoor")
+    target_label = config.get("target_label", 0)
+    source_labels = config.get("source_labels", None) 
+    
     # Training Hyperparameters
     lr = config.get("lr", 0.01)
     momentum = config.get("momentum", 0.9)
@@ -209,11 +216,13 @@ def run_simulation(config):
                 dataset=ds,
                 device=device,
                 poison_fraction=p_frac,
-                target_label=config.get("target_label", 0),
+                target_label=target_label,
                 dataset_name=dataset_name, # Pass dataset name
                 lr=lr,
                 momentum=momentum,
-                batch_size=batch_size
+                batch_size=batch_size,
+                attack_type=attack_type,
+                source_labels=source_labels
             )
         )
 
@@ -227,7 +236,7 @@ def run_simulation(config):
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=test_batch_size, shuffle=False)
 
     # Evaluation helper
-    def evaluate(server_obj: Server, head_state, tail_state, loader, target_label=None):
+    def evaluate(server_obj: Server, head_state, tail_state, loader, target_label=None, attack_type='backdoor', source_labels=None):
         # Instantiate eval models based on dataset
         h_eval, _, t_eval = get_models(dataset_name, device)
         
@@ -248,20 +257,55 @@ def run_simulation(config):
                 inputs, labels = inputs.to(device), labels.to(device)
 
                 # ASR
-                if target_label is not None:
-                    p_inputs = inputs.clone()
-                    if dataset_name == 'mnist':
-                        p_inputs[:, :, 24:28, 24:28] = 2.8  # trigger
-                    elif dataset_name == 'cifar10':
-                        p_inputs[:, :, 28:32, 28:32] = 2.5 # trigger
+                # Only check ASR if it's a backdoor attack and target_label is set
+                if attack_type == 'backdoor' and target_label is not None:
+                    
+                    # Filter for source labels if specified
+                    if source_labels is not None:
+                        # Only samples with label in source_labels are candidates for ASR
+                        # (Because only those would have the trigger injected by the attacker in this scenario)
+                        # We only count samples that belong to source_idxs
+                        
+                        # Find indices where current label is in source_labels
+                        if isinstance(labels, torch.Tensor):
+                             mask = torch.isin(labels, torch.tensor(source_labels, device=labels.device))
+                             p_indices = torch.where(mask)[0]
+                        else:
+                             # Fallback, though labels should be tensor
+                             p_indices = []
+                        
+                        if len(p_indices) > 0:
+                            p_inputs = inputs[p_indices].clone()
+                            p_labels = labels[p_indices]
+                            
+                            if dataset_name == 'mnist':
+                                p_inputs[:, :, 24:28, 24:28] = 2.8  # trigger
+                            elif dataset_name == 'cifar10':
+                                p_inputs[:, :, 28:32, 28:32] = 2.5 # trigger
+                            
+                            h_out = h_eval(p_inputs)
+                            b_out = server_obj.backbone(h_out)
+                            outputs = t_eval(b_out)
+                            _, predicted = outputs.max(1)
 
-                    h_out = h_eval(p_inputs)
-                    b_out = server_obj.backbone(h_out)
-                    outputs = t_eval(b_out)
-                    _, predicted = outputs.max(1)
+                            success += int(predicted.eq(target_label).sum().item())
+                            poison_total += len(p_indices)
+                            
+                    else:
+                        # Standard ASR on all data
+                        p_inputs = inputs.clone()
+                        if dataset_name == 'mnist':
+                            p_inputs[:, :, 24:28, 24:28] = 2.8  # trigger
+                        elif dataset_name == 'cifar10':
+                            p_inputs[:, :, 28:32, 28:32] = 2.5 # trigger
 
-                    success += int(predicted.eq(target_label).sum().item())
-                    poison_total += labels.size(0)
+                        h_out = h_eval(p_inputs)
+                        b_out = server_obj.backbone(h_out)
+                        outputs = t_eval(b_out)
+                        _, predicted = outputs.max(1)
+
+                        success += int(predicted.eq(target_label).sum().item())
+                        poison_total += labels.size(0)
 
                 # Clean accuracy
                 h_out = h_eval(inputs)
@@ -274,7 +318,7 @@ def run_simulation(config):
 
         server_obj.backbone.train()
         acc = 100.0 * correct / max(1, total)
-        asr = 100.0 * success / max(1, poison_total) if target_label is not None else 0.0
+        asr = 100.0 * success / max(1, poison_total) if poison_total > 0 else 0.0
         return acc, asr
 
     print(f"Starting Training for {rounds} rounds on {dataset_name}...")
@@ -315,7 +359,9 @@ def run_simulation(config):
             current_client_state["head"],
             current_client_state["tail"],
             test_loader,
-            target_label=config.get("target_label", 0),
+            target_label=target_label,
+            attack_type=attack_type,
+            source_labels=source_labels
         )
 
         print(
