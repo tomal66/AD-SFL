@@ -258,8 +258,8 @@ def run_simulation(config):
 
                 # ASR
                 # Only check ASR if it's a backdoor attack and target_label is set
+                # ASR
                 if attack_type == 'backdoor' and target_label is not None:
-                    
                     # Filter for source labels if specified
                     if source_labels is not None:
                         # Only samples with label in source_labels are candidates for ASR
@@ -306,6 +306,45 @@ def run_simulation(config):
 
                         success += int(predicted.eq(target_label).sum().item())
                         poison_total += labels.size(0)
+
+                elif attack_type == 'label_flip':
+                    # Define pairs locally
+                    flip_map = {}
+                    if dataset_name == 'mnist':
+                        flip_map = {1: 8, 8: 1, 2: 7, 7: 2, 3: 6, 6: 3}
+                    elif dataset_name == 'cifar10':
+                        flip_map = {1: 8, 8: 1, 2: 7, 7: 2, 3: 5, 5: 3}
+                    
+                    if len(flip_map) > 0:
+                        # Identify samples that should be flipped
+                        # Ground Truth Label -> Target Label
+                        
+                        # We need to find indices where label is in flip_map
+                        # and verify if prediction matches flip_map[label]
+                        
+                        cpu_labels = labels.cpu().numpy() # Convert to numpy for fast map lookup
+                        valid_indices = []
+                        target_preds = []
+                        
+                        for idx, l_val in enumerate(cpu_labels):
+                            if l_val in flip_map:
+                                valid_indices.append(idx)
+                                target_preds.append(flip_map[l_val])
+                        
+                        if valid_indices:
+                             v_idxs = torch.tensor(valid_indices, device=device)
+                             t_preds = torch.tensor(target_preds, device=device)
+                             
+                             # Use CLEAN inputs (we want to see if model misclassifies clean data as target)
+                             p_inputs = inputs[v_idxs]
+                             
+                             h_out = h_eval(p_inputs)
+                             b_out = server_obj.backbone(h_out)
+                             outputs = t_eval(b_out)
+                             _, predicted = outputs.max(1)
+
+                             success += int(predicted.eq(t_preds).sum().item())
+                             poison_total += len(valid_indices)
 
                 # Clean accuracy
                 h_out = h_eval(inputs)
