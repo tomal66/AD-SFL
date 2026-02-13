@@ -3,14 +3,38 @@ import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Dataset, Subset
 import numpy as np
+import os
+import shutil
+
+def safe_load_dataset(dataset_cls, root, train, download, transform, **kwargs):
+    try:
+        return dataset_cls(root, train=train, download=download, transform=transform, **kwargs)
+    except RuntimeError as e:
+        if "Dataset not found or corrupted" in str(e):
+            print(f"Dataset corrupted: {e}. Attempting to delete and re-download.")
+            
+            # Attempt to remove the corrupted dataset files
+            if dataset_cls == datasets.CIFAR10:
+                 tgt_dir = os.path.join(root, 'cifar-10-batches-py')
+                 tgt_file = os.path.join(root, 'cifar-10-python.tar.gz')
+                 if os.path.exists(tgt_dir): shutil.rmtree(tgt_dir)
+                 if os.path.exists(tgt_file): os.remove(tgt_file)
+            elif dataset_cls == datasets.MNIST:
+                 tgt_dir = os.path.join(root, 'MNIST')
+                 if os.path.exists(tgt_dir): shutil.rmtree(tgt_dir)
+            
+            print("Purged potential corrupted files. Retrying download...")
+            return dataset_cls(root, train=train, download=True, transform=transform, **kwargs)
+        else:
+            raise e
 
 def get_mnist_datasets(root='./data'):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
-    train_dataset = datasets.MNIST(root, train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root, train=False, download=True, transform=transform)
+    train_dataset = safe_load_dataset(datasets.MNIST, root, train=True, download=True, transform=transform)
+    test_dataset = safe_load_dataset(datasets.MNIST, root, train=False, download=True, transform=transform)
     return train_dataset, test_dataset
 
 def get_cifar10_datasets(root='./data'):
@@ -24,8 +48,8 @@ def get_cifar10_datasets(root='./data'):
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    train_dataset = datasets.CIFAR10(root, train=True, download=True, transform=transform_train)
-    test_dataset = datasets.CIFAR10(root, train=False, download=True, transform=transform_test)
+    train_dataset = safe_load_dataset(datasets.CIFAR10, root, train=True, download=True, transform=transform_train)
+    test_dataset = safe_load_dataset(datasets.CIFAR10, root, train=False, download=True, transform=transform_test)
     return train_dataset, test_dataset
 
 class PoisonedDataset(Dataset):
