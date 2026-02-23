@@ -30,6 +30,12 @@ class SplitFedServer:
         outputs = self.model(smashed_data)
         loss = self.criterion(outputs, labels)
 
+        # Calculate Accuracy
+        _, predicted = torch.max(outputs.data, 1)
+        correct = (predicted == labels).sum().item()
+        total = labels.size(0)
+        accuracy = correct / total if total > 0 else 0.0
+
         # Backward
         loss.backward()
         self.optimizer.step()
@@ -37,7 +43,7 @@ class SplitFedServer:
         # The gradients with respect to the input of the server model (smashed data)
         grad_to_client = smashed_data.grad.clone().detach()
 
-        return grad_to_client, loss.item()
+        return grad_to_client, loss.item(), accuracy
 
     def aggregate_client_models(self, client_weights_list):
         """

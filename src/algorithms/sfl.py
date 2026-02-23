@@ -22,6 +22,7 @@ def run_sfl_round(clients, server):
         labels_list.append((client.id, labels))
         
     total_loss = 0.0
+    total_acc = 0.0
     grad_to_clients_map = {}
     
     # Step 2 & 3: Server Forward and Backward Propagation
@@ -31,12 +32,14 @@ def run_sfl_round(clients, server):
         labels = next(l for cid, l in labels_list if cid == client_id)
         
         # Server trains on this client's batch
-        grad_to_client, loss = server.train_step(smashed_data, labels)
+        grad_to_client, loss, acc = server.train_step(smashed_data, labels)
         
         grad_to_clients_map[client_id] = grad_to_client
         total_loss += loss
+        total_acc += acc
         
     avg_loss = total_loss / len(clients)
+    avg_acc = total_acc / len(clients)
     
     # Step 4: Client Backward Propagation
     # Clients independently finish the backprop using the gradients from the server.
@@ -52,4 +55,4 @@ def run_sfl_round(clients, server):
     for client in clients:
         client.set_weights(global_weights)
         
-    return avg_loss
+    return avg_loss, avg_acc
