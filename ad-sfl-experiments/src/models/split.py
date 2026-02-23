@@ -7,6 +7,7 @@ modules, which is standard practice for SplitFed setups.
 
 from typing import Tuple
 import torch.nn as nn
+import torch
 
 def split_model_output(output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
