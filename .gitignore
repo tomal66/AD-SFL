@@ -1,0 +1,19 @@
+# Datasets and cache
+data/
+.data/
+*.pt
+*.pth
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+env/
+.env
+.venv
