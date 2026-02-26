@@ -10,7 +10,14 @@ class SplitFedClient:
                  is_malicious=False):
         self.id = client_id
         self.model = model.to(device)
-        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        self.dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True,
+            persistent_workers=True
+        )
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
         self.device = device
         

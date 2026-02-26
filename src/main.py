@@ -114,7 +114,13 @@ def main():
     )
     from torch.utils.data import DataLoader
     
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(
+        test_data, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=True
+    )
     
     # 3. Simulation Loop
     print("Starting Training Simulation...")
