@@ -11,7 +11,8 @@ def main():
     parser.add_argument("--num_clients", type=int, default=3, help="Number of simulated clients")
     parser.add_argument("--epochs", type=int, default=2, help="Number of global epochs (or iterations over clients)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size per client")
-    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "CIFAR10"])
+    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "CIFAR10", "CIFAR100", "ImageNet"])
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face access token for downloading datasets")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -19,18 +20,12 @@ def main():
 
     # 1. Prepare Data
     print("Loading data...")
-    train_data, test_data = get_datasets(args.dataset)
+    train_data, test_data = get_datasets(args.dataset, hf_token=args.hf_token)
     client_datasets = partition_data_iid(train_data, args.num_clients)
 
     # 2. Initialize Models
-    print("Initializing components...")
-    # Need to match the input sizes
-    if args.dataset == "MNIST":
-        client_model_template = ClientModel(in_channels=1, hidden_channels=32)
-        server_model = ServerModel(in_channels=32, hidden_channels=64, num_classes=10, input_size=(14, 14))
-    else:  # CIFAR10
-        client_model_template = ClientModel(in_channels=3, hidden_channels=32)
-        server_model = ServerModel(in_channels=32, hidden_channels=64, num_classes=10, input_size=(16, 16))
+    from src.models.split import get_split_models
+    client_model_template, server_model = get_split_models(args.dataset)
 
     server = SplitFedServer(model=server_model, num_clients=args.num_clients, device=device)
 
@@ -50,9 +45,9 @@ def main():
     print("Starting Training Simulation...")
     for epoch in range(args.epochs):
         # We simulate the SFL-V1 process utilizing the external algorithm file
-        avg_loss = run_sfl_round(clients, server)
+        avg_loss, avg_acc = run_sfl_round(clients, server)
             
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f}")
 
     print("Training finished.")
 
