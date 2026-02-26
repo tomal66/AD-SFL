@@ -17,23 +17,28 @@ class SplitFedClient:
         self.current_activations = None
         self.current_labels = None
 
+    def reset_iterator(self):
+        """Resets the data iterator for a new epoch/round."""
+        self.data_iterator = iter(self.dataloader)
+
     def get_next_batch(self):
         try:
             data, target = next(self.data_iterator)
         except StopIteration:
-            self.data_iterator = iter(self.dataloader)
-            data, target = next(self.data_iterator)
+            return None, None
         return data.to(self.device), target.to(self.device)
 
     def forward_pass(self):
         """
         Runs the forward pass up to the cut layer.
-        Returns the smashed data/activations and labels.
+        Returns the smashed data/activations and labels, or (None, None) if exhausted.
         """
+        data, target = self.get_next_batch()
+        if data is None:
+            return None, None
+
         self.model.train()
         self.optimizer.zero_grad()
-        
-        data, target = self.get_next_batch()
         
         activations = self.model(data)
         
