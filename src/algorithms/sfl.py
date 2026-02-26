@@ -27,7 +27,7 @@ def run_sfl_round(clients, server, local_epochs=1):
             # In a real distributed system, this happens concurrently on devices.
             # Here we loop over them simulating parallel execution.
             for client in clients:
-                result = client.forward_pass()
+                result = client.forward_pass(global_round=epoch)
                 if result[0] is not None:
                     smashed_data, labels = result
                     smashed_activations_list.append((client.id, smashed_data))
