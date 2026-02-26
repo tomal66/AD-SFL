@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--num_clients", type=int, default=3, help="Number of simulated clients")
     parser.add_argument("--epochs", type=int, default=2, help="Number of global epochs (or iterations over clients)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size per client")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for both server and clients")
     parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "CIFAR10", "CIFAR100", "ImageNet"])
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face access token for downloading datasets")
     args = parser.parse_args()
@@ -27,7 +28,7 @@ def main():
     from src.models.split import get_split_models
     client_model_template, server_model = get_split_models(args.dataset)
 
-    server = SplitFedServer(model=server_model, num_clients=args.num_clients, device=device)
+    server = SplitFedServer(model=server_model, num_clients=args.num_clients, lr=args.lr, device=device)
 
     # Initialize clients with their own instantiations of the client model and partitioned data
     clients = []
@@ -36,7 +37,7 @@ def main():
         import copy
         c_model = copy.deepcopy(client_model_template)
         client = SplitFedClient(client_id=i, model=c_model, dataset=client_datasets[i], 
-                                batch_size=args.batch_size, device=device)
+                                batch_size=args.batch_size, lr=args.lr, device=device)
         clients.append(client)
 
     from src.algorithms import run_sfl_round
