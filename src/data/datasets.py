@@ -63,11 +63,11 @@ def get_datasets(dataset_name="MNIST", data_dir="./data", hf_token=None):
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
         transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
         train_ds = hf_datasets.load_dataset("uoft-cs/cifar100", split="train", cache_dir=data_dir, token=hf_token)
         test_ds = hf_datasets.load_dataset("uoft-cs/cifar100", split="test", cache_dir=data_dir, token=hf_token)
