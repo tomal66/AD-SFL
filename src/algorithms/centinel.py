@@ -222,8 +222,12 @@ def run_sfl_centinel_round(
       ✅ Avoids ambiguous server aggregation calls: keeps only client-side FedAvg broadcast
          (server stays as a single shared model trained by accepted clients)
     """
-    server.to(device)
-    server.train()
+    server.model.to(device)
+    for sm in server.models:
+        sm.to(device)
+    server.model.train()
+    for sm in server.models:
+        sm.train()
 
     total_loss = 0.0
     total_acc = 0.0

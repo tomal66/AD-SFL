@@ -358,12 +358,14 @@ plt.show()
 # 
 # This section evaluates the Centinel defense method, which uses anomaly detection on activation centroids and Subjective Logic to build client reputations over time.
 
-# In[10]:
+# In[6]:
 
 
 from src.algorithms.centinel import run_sfl_centinel_round, CentinelState
 from torch.utils.data import Subset
 import numpy as np
+from torch.utils.data import DataLoader
+
 
 # --- Centinel Hyperparameters ---
 NUM_REF_SAMPLES_PER_LABEL = 10
@@ -381,7 +383,7 @@ ref_indices = []
 num_classes = len(np.unique(labels))
 for c in range(num_classes):
     c_indices = np.where(labels == c)[0]
-    ref_indices.extend(np.random.choice(c_indices, NUM_REF_SAMPLES_PER_LABEL, replace=False))
+    ref_indices.extend([int(x) for x in np.random.choice(c_indices, NUM_REF_SAMPLES_PER_LABEL, replace=False)])
 
 ref_dataset = Subset(test_data, ref_indices)
 ref_loader = DataLoader(ref_dataset, batch_size=batch_size, shuffle=False)
@@ -416,7 +418,7 @@ with torch.no_grad():
                 state.global_centroids[lbl] = c[lbl]
 
 
-# In[ ]:
+# In[7]:
 
 
 import matplotlib.pyplot as plt
@@ -446,7 +448,7 @@ test_loader = DataLoader(
 pbar = trange(rounds, desc="Training", unit="round")
 for r in pbar:
     train_loss, train_acc, scores, accepted_clients = run_sfl_centinel_round(clients, server, state, ref_loader, local_epochs=1, device=device)
-
+    print(scores)
     # Evaluate Test Acc and ASR
     eval_client = clients[0].model
     test_acc = evaluate_accuracy(eval_client, server.model, test_loader, device)
