@@ -1,16 +1,28 @@
 import torch
 from torch.utils.data import DataLoader
+import numpy as np
 
 class SplitFedClient:
     """
     Simulates a client in a Split Federated Learning setup.
     """
-    def __init__(self, client_id, model, dataset, batch_size=32, lr=0.01, device='cpu'):
+    def __init__(self, client_id, model, dataset, batch_size=32, lr=0.01, device='cpu', 
+                 is_malicious=False):
         self.id = client_id
         self.model = model.to(device)
-        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        self.dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True,
+            persistent_workers=True
+        )
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
         self.device = device
+        
+        # Attack identifier (logging only, poisoning happens natively in self.dataloader)
+        self.is_malicious = is_malicious
         
         # Iterator to fetch batches across simulation epochs
         self.data_iterator = iter(self.dataloader)
@@ -28,7 +40,9 @@ class SplitFedClient:
             return None, None
         return data.to(self.device), target.to(self.device)
 
-    def forward_pass(self):
+
+
+    def forward_pass(self, global_round=0):
         """
         Runs the forward pass up to the cut layer.
         Returns the smashed data/activations and labels, or (None, None) if exhausted.

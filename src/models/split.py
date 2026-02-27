@@ -49,8 +49,8 @@ class ServerModel(nn.Module):
         x = self.fc2(x)
         return x
 
-def get_split_models(dataset_name, num_classes=None):
-    from .split_resnet import ResNet18Client, ResNet18Server, WideResNet50Client, WideResNet50Server
+def get_split_models(dataset_name, num_classes=None, weights="DEFAULT"):
+    from .split_resnet import ResNet18Client, ResNet18Server, build_wideresnet50_split
     
     if dataset_name == "MNIST":
         client_model = ClientModel(in_channels=1, hidden_channels=32)
@@ -59,11 +59,17 @@ def get_split_models(dataset_name, num_classes=None):
         client_model = ResNet18Client(dataset=dataset_name)
         server_model = ResNet18Server(num_classes=num_classes or 10)
     elif dataset_name == "CIFAR100":
-        client_model = WideResNet50Client(dataset=dataset_name)
-        server_model = WideResNet50Server(num_classes=num_classes or 100)
+        client_model, server_model = build_wideresnet50_split(
+            dataset=dataset_name, 
+            num_classes=num_classes or 100, 
+            weights=weights
+        )
     elif dataset_name == "ImageNet":
-        client_model = WideResNet50Client(dataset=dataset_name)
-        server_model = WideResNet50Server(num_classes=num_classes or 1000)
+        client_model, server_model = build_wideresnet50_split(
+            dataset=dataset_name, 
+            num_classes=num_classes or 1000, 
+            weights=weights
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
