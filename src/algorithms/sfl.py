@@ -44,7 +44,7 @@ def run_sfl_round(clients, server, local_epochs=1):
             # The server processes the smashed data from each client.
             for client_id, smashed_data in smashed_activations_list:
                 labels = next(l for cid, l in labels_list if cid == client_id)
-                grad_to_client, loss, acc = server.train_step(smashed_data, labels)
+                grad_to_client, loss, acc = server.train_step(smashed_data, labels, client_id=client_id)
                 
                 grad_to_clients_map[client_id] = grad_to_client
                 total_loss += loss
@@ -67,5 +67,8 @@ def run_sfl_round(clients, server, local_epochs=1):
     # Broadcast updated client model back to all clients
     for client in clients:
         client.set_weights(global_weights)
+        
+    # Step 6: FedAvg of Server Models
+    server.aggregate_server_models()
         
     return avg_loss, avg_acc
