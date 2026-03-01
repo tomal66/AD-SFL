@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=2, help="Number of global epochs (or iterations over clients)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size per client")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for both server and clients")
-    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "CIFAR10", "CIFAR100", "ImageNet"])
+    parser.add_argument("--dataset", type=str, default="MNIST", choices=["MNIST", "CIFAR10", "CIFAR100", "ImageNet", "TinyImageNet"])
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face access token for downloading datasets")
     
     # Attack Configuration

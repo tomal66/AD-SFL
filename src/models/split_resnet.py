@@ -8,7 +8,7 @@ class ResNet18Client(nn.Module):
         resnet = resnet18(weights=None)
         
         # for CIFAR10/100, the first conv is usually replaced to handle 32x32 images
-        if dataset in ["CIFAR10", "CIFAR100"]:
+        if dataset in ["CIFAR10", "CIFAR100", "TinyImageNet"]:
             resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
             resnet.maxpool = nn.Identity()
             
@@ -53,7 +53,7 @@ def build_wide_resnet50_2_backbone(dataset="CIFAR100", weights="DEFAULT"):
 
     backbone = wide_resnet50_2(weights=weights)
 
-    if dataset in ["CIFAR10", "CIFAR100"]:
+    if dataset in ["CIFAR10", "CIFAR100", "TinyImageNet"]:
         backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         backbone.maxpool = nn.Identity()
 

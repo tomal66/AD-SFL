@@ -70,6 +70,12 @@ def get_split_models(dataset_name, num_classes=None, weights="DEFAULT"):
             num_classes=num_classes or 1000, 
             weights=weights
         )
+    elif dataset_name == "TinyImageNet":
+        client_model, server_model = build_wideresnet50_split(
+            dataset=dataset_name, 
+            num_classes=num_classes or 200, 
+            weights="NONE"
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     

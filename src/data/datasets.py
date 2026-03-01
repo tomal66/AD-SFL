@@ -94,6 +94,22 @@ def get_datasets(dataset_name="MNIST", data_dir="./data", hf_token=None):
         train_dataset = HFWrapperDataset(train_ds, transform=transform_train, image_key="image", label_key="label", convert_mode="RGB")
         test_dataset = HFWrapperDataset(test_ds, transform=transform_test, image_key="image", label_key="label", convert_mode="RGB")
         
+    elif dataset_name == "TinyImageNet":
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(64, padding=8),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        train_ds = hf_datasets.load_dataset("zh-plus/tiny-imagenet", split="train", cache_dir=data_dir, token=hf_token)
+        test_ds = hf_datasets.load_dataset("zh-plus/tiny-imagenet", split="valid", cache_dir=data_dir, token=hf_token)
+        train_dataset = HFWrapperDataset(train_ds, transform=transform_train, image_key="image", label_key="label", convert_mode="RGB")
+        test_dataset = HFWrapperDataset(test_ds, transform=transform_test, image_key="image", label_key="label", convert_mode="RGB")
+        
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")
         
