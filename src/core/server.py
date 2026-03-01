@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import copy
 
+_BN_BUFFER_KEYS = ("running_mean", "running_var", "num_batches_tracked")
+def _is_bn_buffer_key(k: str) -> bool:
+    return any(s in k for s in _BN_BUFFER_KEYS)
+
 class SplitFedServer:
     """
     Simulates the central server in a Split Federated Learning setup.
@@ -68,33 +72,35 @@ class SplitFedServer:
 
         return grad_to_client, loss.item(), accuracy
 
-    def aggregate_server_models(self, active_client_indices=None):
-        """
-        Performs Federated Averaging (FedAvg) on the server side models.
-        Updates the global server model and synchronizes all client-specific server models.
-        Optionally takes a list of client indices to aggregate over (defaulting to all).
-        """
+    def aggregate_server_models(self, active_client_indices=None, weights=None, skip_bn_buffers=True):
         if active_client_indices is None:
             active_client_indices = list(range(self.num_clients))
-            
-        num_active = len(active_client_indices)
-        if num_active == 0:
+
+        if weights is None:
+            weights = [1.0] * len(active_client_indices)
+
+        total_w = float(sum(weights))
+        if total_w <= 0 or len(active_client_indices) == 0:
             return
 
-        first_index = active_client_indices[0]
-        global_state = copy.deepcopy(self.models[first_index].state_dict())
-        for key in global_state.keys():
-            for i in active_client_indices[1:]:
-                global_state[key] += self.models[i].state_dict()[key]
-            
-            if global_state[key].dtype.is_floating_point:
-                global_state[key] = torch.div(global_state[key], num_active)
+        first = active_client_indices[0]
+        global_state = copy.deepcopy(self.models[first].state_dict())
+
+        for k in global_state.keys():
+            if skip_bn_buffers and _is_bn_buffer_key(k):
+                continue
+
+            v = global_state[k]
+            if torch.is_floating_point(v):
+                global_state[k] = v * (weights[0] / total_w)
+                for idx, w in zip(active_client_indices[1:], weights[1:]):
+                    global_state[k] += self.models[idx].state_dict()[k] * (w / total_w)
             else:
-                global_state[key] = torch.div(global_state[key], num_active, rounding_mode='trunc')
-                
-        self.model.load_state_dict(global_state)
+                global_state[k] = v  # keep
+
+        self.model.load_state_dict(global_state, strict=False)
         for m in self.models:
-            m.load_state_dict(global_state)
+            m.load_state_dict(global_state, strict=False)
 
     def aggregate_client_models(self, client_weights_list):
         """

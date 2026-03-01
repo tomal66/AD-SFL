@@ -1,5 +1,44 @@
 import torch
 import torch.nn.functional as F
+import copy
+
+
+_BN_BUFFER_KEYS = ("running_mean", "running_var", "num_batches_tracked")
+
+def _is_bn_buffer_key(k: str) -> bool:
+    return any(s in k for s in _BN_BUFFER_KEYS)
+
+def fedavg_state_dicts_weighted(state_dicts, weights, skip_bn_buffers=True):
+    """
+    Weighted FedAvg over a list of state_dicts.
+    - state_dicts: list[OrderedDict[str, Tensor]]
+    - weights: list[float] (e.g., local sample counts)
+    - skip_bn_buffers: if True, do NOT aggregate BN running stats / counters
+    Returns averaged_state_dict.
+    """
+    assert len(state_dicts) == len(weights) and len(state_dicts) > 0
+    total_w = float(sum(weights))
+    if total_w <= 0:
+        raise ValueError("Total FedAvg weight must be > 0")
+
+    out = copy.deepcopy(state_dicts[0])
+
+    for k in out.keys():
+        if skip_bn_buffers and _is_bn_buffer_key(k):
+            # keep the first client's buffers (or you can keep global later)
+            continue
+
+        # initialize with weighted first
+        v = state_dicts[0][k]
+        if torch.is_floating_point(v):
+            out[k] = v * (weights[0] / total_w)
+            for sd, w in zip(state_dicts[1:], weights[1:]):
+                out[k] += sd[k] * (w / total_w)
+        else:
+            # integer buffers (rare): take from first (or majority). Averaging ints is meaningless.
+            out[k] = v
+
+    return out
 
 
 class CentinelState:
@@ -317,25 +356,34 @@ def run_sfl_centinel_round(
     avg_acc = total_acc / total_batches if total_batches > 0 else 0.0
 
     # ---------------------------------------------------------
-    # Step E: FedAvg client-side weights over accepted clients, broadcast to all
+    # Step E: FedAvg client-side weights over accepted clients (WEIGHTED), broadcast to all
     # ---------------------------------------------------------
-    # Expect each client implements get_weights()/set_weights() for its *client-side* model
-    client_weights = [c.get_weights() for c in accepted_clients]
+    client_state_dicts = [c.get_weights() for c in accepted_clients]
+    client_nsamples = [len(c.dataloader.dataset) for c in accepted_clients]  # robust
 
-    # If your server helper returns averaged client weights, keep it.
-    # Otherwise, you can replace this call with explicit weight averaging.
-    global_client_weights = server.aggregate_client_models(client_weights)
+    global_client_weights = fedavg_state_dicts_weighted(
+        client_state_dicts,
+        client_nsamples,
+        skip_bn_buffers=True,     # important for non-IID + BN
+    )
 
     for client in clients:
         client.set_weights(global_client_weights)
 
     # Aggregate server side models for accepted clients
-    server.aggregate_server_models(active_client_indices=list(accepted_ids))
+    accepted_idx = list(accepted_ids)
+    accepted_ws = [len(clients[i].dataloader.dataset) for i in accepted_idx]
+
+    server.aggregate_server_models(
+        active_client_indices=accepted_idx,
+        weights=accepted_ws,
+        skip_bn_buffers=True
+    )
 
     # ---------------------------------------------------------
     # Step F: Refresh reference centroids using updated client model (clients[0])
     # ---------------------------------------------------------
-    ref_client = clients[0]
+    ref_client = next(c for c in clients if c.id in accepted_ids)  # any accepted client
     ref_client.model.eval()
 
     new_sums = {}
