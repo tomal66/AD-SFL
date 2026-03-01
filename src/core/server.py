@@ -17,8 +17,17 @@ class SplitFedServer:
         self.models = [copy.deepcopy(model).to(device) for _ in range(num_clients)]
         
         # Each server model gets its own optimizer
-        self.optimizers = [torch.optim.SGD(m.parameters(), lr=lr, **kwargs) for m in self.models]
-        
+        self.optimizers = [
+            torch.optim.SGD(
+                m.parameters(),
+                lr=lr,
+                momentum=0.9,
+                weight_decay=5e-4,
+                nesterov=True
+            )
+            for m in self.models
+        ]
+                
         # Maintain a dummy optimizer attribute for compatibility
         self.optimizer = self.optimizers[0] 
         

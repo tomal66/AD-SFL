@@ -18,7 +18,13 @@ class SplitFedClient:
             pin_memory=True,
             persistent_workers=True
         )
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=5e-4,
+            nesterov=True
+        )
         self.device = device
         
         # Attack identifier (logging only, poisoning happens natively in self.dataloader)
