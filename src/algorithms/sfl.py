@@ -13,6 +13,7 @@ def run_sfl_round(clients, server, local_epochs=1):
     total_loss = 0.0
     total_acc = 0.0
     total_batches = 0
+    active_client_ids_in_round = set()
     
     for epoch in range(local_epochs):
         for client in clients:
@@ -33,6 +34,7 @@ def run_sfl_round(clients, server, local_epochs=1):
                     smashed_activations_list.append((client.id, smashed_data))
                     labels_list.append((client.id, labels))
                     active_clients.append(client)
+                    active_client_ids_in_round.add(client.id)
             
             # If no clients have data left, this epoch is complete
             if not active_clients:
@@ -61,14 +63,14 @@ def run_sfl_round(clients, server, local_epochs=1):
     avg_acc = total_acc / total_batches if total_batches > 0 else 0.0
     
     # Step 5: FedAvg of Client Models
-    client_weights = [c.get_weights() for c in clients]
-    global_weights = server.aggregate_client_models(client_weights)
+    client_payloads = [(c.get_weights(), c.num_samples()) for c in clients]
+    global_weights = server.aggregate_client_models_weighted(client_payloads)
     
     # Broadcast updated client model back to all clients
     for client in clients:
         client.set_weights(global_weights)
         
     # Step 6: FedAvg of Server Models
-    server.aggregate_server_models()
+    server.aggregate_server_models(active_client_indices=list(active_client_ids_in_round))
         
     return avg_loss, avg_acc

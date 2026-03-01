@@ -112,3 +112,17 @@ class SplitFedServer:
                 aggregated_weights[key] = torch.div(aggregated_weights[key], len(client_weights_list), rounding_mode='trunc')
                 
         return aggregated_weights
+
+    def aggregate_client_models_weighted(self, client_payloads):
+        # client_payloads: List[(state_dict, n_samples)]
+        total = sum(n for _, n in client_payloads)
+        aggregated = copy.deepcopy(client_payloads[0][0])
+
+        for k in aggregated.keys():
+            # init with first client weighted
+            aggregated[k] = aggregated[k] * (client_payloads[0][1] / total)
+
+            for sd, n in client_payloads[1:]:
+                aggregated[k] += sd[k] * (n / total)
+
+        return aggregated

@@ -84,3 +84,6 @@ class SplitFedClient:
     def set_weights(self, weights):
         """Sets the client model's parameters (e.g., from server aggregation)."""
         self.model.load_state_dict(weights)
+
+    def num_samples(self):
+        return len(self.dataloader.dataset)
