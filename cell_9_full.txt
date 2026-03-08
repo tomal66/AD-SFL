@@ -1,0 +1,468 @@
+@torch.no_grad()
+def sample_reference_data_per_label(dataset, num_samples_per_label):
+    # Return dict {label: (Xs [K,1,28,28], Ys [K])}
+    label_buckets = {i: [] for i in range(10)}
+    for x, y in DataLoader(dataset, batch_size=512, shuffle=True):
+        for xi, yi in zip(x, y):
+            if len(label_buckets[int(yi)]) < num_samples_per_label:
+                label_buckets[int(yi)].append((xi, yi))
+        if all(len(label_buckets[i]) >= num_samples_per_label for i in range(10)):
+            break
+    out = {}
+    for lab in range(10):
+        if len(label_buckets[lab]) == 0:
+            continue
+        xs, ys = zip(*label_buckets[lab])
+        out[lab] = (torch.stack(xs, dim=0).to(DEVICE), torch.tensor([lab]*len(xs), device=DEVICE))
+    return out
+
+@torch.no_grad()
+def compute_ref_hist_data(client_model, ref_samples,
+                          num_bins=HIST_NUM_BINS,
+                          range_mode=HIST_RANGE_MODE,
+                          range_pct=HIST_RANGE_PCT,
+                          max_ref_samples_per_class=HIST_MAX_REF_SAMPLES,
+                          eps=KL_EPS):
+    """
+    Returns:
+      ref_hist_data[label] = {"bin_edges": np.ndarray[B+1], "p_ref": np.ndarray[B]}
+    """
+    client_model.eval()
+    ref_hist_data = {}
+
+    for lab, (xs, ys) in ref_samples.items():
+        z = client_model(xs)
+        vals = z.detach().cpu().numpy().reshape(-1).astype(np.float64)
+
+        if vals.size == 0:
+            continue
+
+        if max_ref_samples_per_class is not None and vals.size > max_ref_samples_per_class:
+            idx = np.random.choice(vals.size, max_ref_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        if range_mode == "percentile":
+            lo, hi = np.percentile(vals, list(range_pct))
+        else:
+            lo, hi = float(vals.min()), float(vals.max())
+
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            lo, hi = float(vals.min()), float(vals.max() + 1e-6)
+
+        bin_edges = np.linspace(lo, hi, num_bins + 1)
+
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        p_ref = counts.astype(np.float64) + eps
+        p_ref = p_ref / p_ref.sum()
+
+        ref_hist_data[int(lab)] = {"bin_edges": bin_edges, "p_ref": p_ref}
+
+    return ref_hist_data
+
+
+
+@torch.no_grad()
+def compute_ref_kde_data(client_model, ref_samples, max_ref_samples_per_class=KDE_MAX_REF_SAMPLES):
+    """
+    For each label k in ref_samples, compute and store:
+      - flattened activation values (1D) from the reference set
+      - a KDE bandwidth h_k (either fixed or via Silverman's rule)
+
+    Returns:
+      ref_kde_data: {label: {"values": np.ndarray, "bandwidth": float}}
+    """
+    client_model.eval()
+    ref_kde_data = {}
+
+    for lab, (xs, ys) in ref_samples.items():
+        # xs already on DEVICE
+        z = client_model(xs)  # [K, D]
+        vals = z.detach().cpu().numpy().reshape(-1).astype(np.float64)  # 1D
+
+        if vals.size == 0:
+            continue
+
+        # Optional subsampling for efficiency
+        if max_ref_samples_per_class is not None and vals.size > max_ref_samples_per_class:
+            idx = np.random.choice(vals.size, max_ref_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        # Bandwidth selection
+        if KDE_BANDWIDTH_MODE == "fixed":
+            h = float(KDE_BANDWIDTH)
+        else:
+            # Silverman's rule-of-thumb on reference vals
+            std = float(np.std(vals))
+            q75, q25 = np.percentile(vals, [75, 25])
+            iqr = float(q75 - q25)
+            if std <= 0 and iqr <= 0:
+                sigma = 1.0  # fallback
+            else:
+                sigma = min(std, iqr / 1.34) if (std > 0 and iqr > 0) else max(std, iqr / 1.34)
+            n = max(1, vals.size)
+            h = 0.9 * sigma * (n ** (-1.0 / 5.0)) if n > 1 else 1.0
+
+        ref_kde_data[int(lab)] = {
+            "values": vals,
+            "bandwidth": max(h, 1e-6),  # avoid degenerate h
+        }
+
+    return ref_kde_data
+
+
+def gaussian_kde_logpdf_loo(samples, h, eps=KL_EPS):
+    """
+    Leave-one-out log-density for points equal to the KDE basis itself.
+
+    samples: np.ndarray [N] (evaluation points == basis points)
+    h: scalar bandwidth
+    returns: np.ndarray [N] where each entry is log p_{-i}(x_i)
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    N = samples.size
+    if N < 2:
+        return np.full((N,), np.log(eps), dtype=np.float64)
+
+    h = float(max(h, 1e-6))
+
+    # diff [N, N]
+    diff = (samples[:, None] - samples[None, :]) / h
+    exponent = -0.5 * diff * diff
+
+    # stable log-sum-exp per row
+    max_exp = np.max(exponent, axis=1, keepdims=True)
+    exp_shifted = np.exp(exponent - max_exp)
+
+    # leave-one-out: subtract self-kernel term exp(0)=1 from each row sum
+    row_sum = exp_shifted.sum(axis=1) - 1.0
+    row_sum = np.maximum(row_sum, 1e-300)  # avoid log(0)
+
+    log_sum = max_exp.squeeze(-1) + np.log(row_sum)
+
+    # normalization: (N-1) kernels
+    log_norm = np.log(N - 1) + np.log(h) + 0.5 * np.log(2.0 * np.pi)
+    log_density = log_sum - log_norm
+
+    # clamp
+    log_density = np.maximum(log_density, np.log(eps))
+    return log_density
+
+
+@torch.no_grad()
+def compute_client_kl_divergence_binning(
+    client_model,
+    loader,
+    ref_hist_data,
+    epsilon=KL_EPS,
+    agg_mode=KL_AGGREGATION,
+    max_client_samples_per_class=HIST_MAX_CLIENT_SAMPLES,
+    min_images_per_label=2,              # NEW: skip labels with too few images
+    weighted_by_label_mass=True,         # NEW: weight by image-count (not activation scalars)
+):
+    """
+    For each label k present, compute:
+      KL(p_client^k || p_ref^k)
+    where p_client^k is a histogram over ref bins (computed from flattened activations).
+
+    Aggregation (non-IID robust):
+      - If weighted_by_label_mass=True: weights ∝ (# client images with label k)
+      - Otherwise: uniform over present labels
+
+    Returns: scalar anomaly score.
+    """
+    client_model.eval()
+
+    # Collect flattened activations per label + image counts per label
+    label_to_vals = {lab: [] for lab in ref_hist_data.keys()}
+    label_img_counts = {lab: 0 for lab in ref_hist_data.keys()}
+
+    for x, y in loader:
+        x = x.to(DEVICE)
+        z = client_model(x)
+        z_cpu = z.detach().cpu()
+        y_cpu = y.cpu()
+
+        for lab in label_to_vals.keys():
+            mask = (y_cpu == lab)
+            if mask.any():
+                # count images (not activation scalars)
+                label_img_counts[lab] += int(mask.sum().item())
+
+                # store activation scalars (flattened)
+                v = z_cpu[mask].reshape(-1)
+                label_to_vals[lab].append(v)
+
+    per_label_kls = []
+    per_label_weights = []
+
+    for lab, chunks in label_to_vals.items():
+        if len(chunks) == 0:
+            continue
+
+        # enforce minimum images per label (important under Dirichlet)
+        if label_img_counts.get(lab, 0) < min_images_per_label:
+            continue
+
+        vals = torch.cat(chunks, dim=0).numpy().astype(np.float64)
+        if vals.size == 0:
+            continue
+
+        # subsample activation scalars for efficiency (weights remain image-count based)
+        if max_client_samples_per_class is not None and vals.size > max_client_samples_per_class:
+            idx = np.random.choice(vals.size, max_client_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        ref_info = ref_hist_data.get(lab, None)
+        if ref_info is None:
+            continue
+
+        bin_edges = ref_info["bin_edges"]
+        p_ref = ref_info["p_ref"]
+
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        p_cli = counts.astype(np.float64) + epsilon
+        p_cli = p_cli / (p_cli.sum() + 1e-12)
+
+        # KL(p_cli || p_ref)
+        kl = float(np.sum(p_cli * (np.log(p_cli) - np.log(p_ref))))
+        per_label_kls.append(kl)
+
+        # NEW: weight by number of images for that label (not vals.size)
+        per_label_weights.append(float(label_img_counts[lab]) if weighted_by_label_mass else 1.0)
+
+    if not per_label_kls:
+        return 0.0
+
+    kls = np.asarray(per_label_kls, dtype=np.float64)
+    wts = np.asarray(per_label_weights, dtype=np.float64)
+    wts = wts / (wts.sum() + 1e-12)
+
+    if agg_mode == "max":
+        return float(kls.max())
+    elif agg_mode == "sum":
+        return float(np.sum(kls * wts))
+    else:  # "mean"
+        return float(np.sum(kls * wts))
+
+
+
+
+@torch.no_grad()
+def compute_client_kl_divergence(
+    client_model,
+    loader,
+    ref_kde_data,
+    epsilon=KL_EPS,
+    agg_mode=KL_AGGREGATION,
+    max_client_samples_per_class=KDE_MAX_CLIENT_SAMPLES,
+    min_images_per_label=2,              # skip labels with too few client images
+    weighted_by_label_mass=True,         # key for non-IID stability
+):
+    """
+    Non-IID robust KDE-KL anomaly score.
+
+    Per label k:
+      KL_k ≈ E_{v~client,k}[ log p_client,k(v) - log p_ref,k(v) ]
+    with p_client,k evaluated via leave-one-out KDE to reduce self-density bias.
+
+    Aggregation:
+      - If weighted_by_label_mass=True: weights ∝ (# client images with label k)
+      - Otherwise: uniform over present labels
+    """
+    client_model.eval()
+
+    # Collect flattened activations per label + image counts per label
+    label_to_vals = {lab: [] for lab in ref_kde_data.keys()}
+    label_img_counts = {lab: 0 for lab in ref_kde_data.keys()}
+
+    for x, y in loader:
+        x = x.to(DEVICE)
+        z = client_model(x)
+        z_cpu = z.detach().cpu()
+        y_cpu = y.cpu()
+
+        for lab in label_to_vals.keys():
+            mask = (y_cpu == lab)
+            if mask.any():
+                # count images (not activation scalars)
+                label_img_counts[lab] += int(mask.sum().item())
+
+                # store activation scalars (flattened)
+                v = z_cpu[mask].reshape(-1)
+                label_to_vals[lab].append(v)
+
+    per_label_kls = []
+    per_label_weights = []
+
+    for lab, chunks in label_to_vals.items():
+        if len(chunks) == 0:
+            continue
+
+        # enforce minimum images per label (important under Dirichlet)
+        if label_img_counts.get(lab, 0) < min_images_per_label:
+            continue
+
+        vals = torch.cat(chunks, dim=0).numpy().astype(np.float64)
+        if vals.size < 2:
+            continue
+
+        # subsample activation scalars for efficiency (keep weights based on image counts)
+        if max_client_samples_per_class is not None and vals.size > max_client_samples_per_class:
+            idx = np.random.choice(vals.size, max_client_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        ref_info = ref_kde_data.get(lab, None)
+        if ref_info is None or ref_info["values"].size < 2:
+            continue
+
+        ref_vals = ref_info["values"]
+        h = ref_info["bandwidth"]
+
+        # client log-density via leave-one-out KDE (reduces bias under small sample support)
+        log_p_i = gaussian_kde_logpdf_loo(vals, h, eps=epsilon)
+
+        # reference log-density at the same points
+        log_p_ref = gaussian_kde_logpdf(vals, ref_vals, h, eps=epsilon)
+
+        kl = float(np.mean(log_p_i - log_p_ref))
+        per_label_kls.append(kl)
+
+        if weighted_by_label_mass:
+            per_label_weights.append(float(label_img_counts[lab]))
+        else:
+            per_label_weights.append(1.0)
+
+    if not per_label_kls:
+        return 0.0
+
+    kls = np.asarray(per_label_kls, dtype=np.float64)
+    wts = np.asarray(per_label_weights, dtype=np.float64)
+    wts = wts / (wts.sum() + 1e-12)
+
+    if agg_mode == "max":
+        return float(kls.max())
+    elif agg_mode == "sum":
+        return float(np.sum(kls * wts))
+    else:  # "mean"
+        return float(np.sum(kls * wts))
+
+    
+@torch.no_grad()
+def compute_client_anomaly_score(client_model, loader, ref_data):
+    if KL_ESTIMATOR == "kde":
+        return compute_client_kl_divergence(
+            client_model, loader, ref_data,
+            epsilon=KL_EPS,
+            agg_mode=KL_AGGREGATION,
+            max_client_samples_per_class=KDE_MAX_CLIENT_SAMPLES,
+        )
+    elif KL_ESTIMATOR == "binning":
+        return compute_client_kl_divergence_binning(
+            client_model, loader, ref_data,
+            epsilon=KL_EPS,
+            agg_mode=KL_AGGREGATION,
+            max_client_samples_per_class=HIST_MAX_CLIENT_SAMPLES,
+            # weighted_by_client_mass=True,
+        )
+    else:
+        raise ValueError(f"Unknown KL_ESTIMATOR: {KL_ESTIMATOR}")
+
+
+
+
+
+@torch.no_grad()
+def get_ref_centroids(client_model, ref_samples):
+    centroids = {}
+    client_model.eval()
+    for lab, (xs, ys) in ref_samples.items():
+        z = client_model(xs)  # [K,128]
+        centroids[lab] = z.mean(dim=0)  # [128]
+    return centroids
+
+@torch.no_grad()
+def compute_client_centroids(client_model, loader):
+    client_model.eval()
+    feats = []
+    labels = []
+    for x, y in loader:
+        x = x.to(DEVICE)
+        z = client_model(x)  # [N,128]
+        feats.append(z.cpu())
+        labels.append(y.cpu())
+    if len(feats) == 0:
+        return {}
+    feats = torch.cat(feats, dim=0)  # [M,128]
+    labels = torch.cat(labels, dim=0) # [M]
+    centroids = {}
+    for lab in labels.unique(sorted=True).tolist():
+        idx = (labels == lab).nonzero(as_tuple=False).squeeze()
+        centroids[int(lab)] = feats[idx].mean(dim=0)  # on CPU
+    return centroids
+
+def centroid_shift(client_centroids, global_centroids):
+    total_shift = 0.0
+    count = 0
+    for lab, ccent in client_centroids.items():
+        if lab in global_centroids:
+            gcent = global_centroids[lab].detach().cpu()
+            total_shift += torch.norm(ccent - gcent, p=2).item()
+            count += 1
+    return (total_shift / max(count, 1))
+
+def detect_malicious_clients(centroid_shifts, interactions, tau=0.1, Q_i=0.8, rho=0.4, eta=0.6, kappa=0.7, zeta=0.3, omega=0.5, current_malicious_clients=None, min_accept_k=1):
+    # Normalize scores
+    ssum = sum(centroid_shifts) if sum(centroid_shifts) > 0 else 1e-12
+    scores = [s/ssum for s in centroid_shifts]
+    accepted = []
+    updated_interactions = []
+    reputation_scores = []
+    tp=tn=fp=fn=0
+
+    for i, score in enumerate(scores):
+        alpha_p = np.mean(interactions[i]['alpha_p']) if interactions[i]['alpha_p'] else 0.0
+        beta_p  = np.mean(interactions[i]['beta_p']) if interactions[i]['beta_p'] else 0.0
+        # new observation
+        if score > tau:
+            alpha_r, beta_r = 0.0, 1.0  # negative
+        else:
+            alpha_r, beta_r = 1.0, 0.0  # positive
+
+        # weighted interactions
+        alpha_i = kappa * rho * alpha_r + zeta * rho * alpha_p
+        beta_i  = kappa * eta * beta_r + zeta * eta * beta_p
+
+        u_i = 1 - Q_i
+        b_i = (1 - u_i) * (alpha_i / (alpha_i + beta_i)) if (alpha_i + beta_i) != 0 else 0.0
+        d_i = (1 - u_i) * (beta_i  / (alpha_i + beta_i)) if (alpha_i + beta_i) != 0 else 0.0
+        a_i = 0.5
+        # gamma_i = b_i + a_i * u_i
+
+        gamma_i = b_i 
+        reputation_scores.append(gamma_i)
+
+        # update history
+        interactions[i]['alpha_p'].append(alpha_r)
+        interactions[i]['beta_p'].append(beta_r)
+        updated_interactions.append(interactions[i])
+
+        if gamma_i >= omega:
+            accepted.append(i)
+
+        # inside detect_malicious_clients(..., min_accept_k=1)
+        if len(accepted) == 0 and min_accept_k > 0:
+            ranked = np.argsort(centroid_shifts)[:min_accept_k].tolist()
+            accepted = ranked
+
+
+        # metrics
+        if current_malicious_clients is not None:
+            if i in current_malicious_clients:
+                if gamma_i < omega: tp += 1  # detected bad
+                else: fn += 1               # missed bad
+            else:
+                if gamma_i >= omega: tn += 1 # accepted good
+                else: fp += 1
+
+    metrics = dict(TP=tp, TN=tn, FP=fp, FN=fn)
+    return accepted, updated_interactions, metrics, reputation_scores

@@ -1,0 +1,229 @@
+
+
+def splitfed_learning_exclude_malicious(client_loaders, test_loader, rounds=ROUNDS, tau=TAU, omega=OMEGA, num_samples_per_label=NUM_SAMPLES_PER_LABEL, current_malicious_clients=None):
+
+    # Initialize dynamic attack manager
+    attack_manager = DynamicAttackManager(
+        malicious_indices=malicious_clients_indices,
+        attack_pattern=ATTACK_PATTERN,
+        prob_flip=MALICIOUS_FLIP_PROB,
+        cyclic_period=CYCLIC_ATTACK_PERIOD,
+        periodic_interval=PERIODIC_ATTACK_INTERVAL
+    )
+
+    num_clients = len(client_loaders)
+    # models & optimizers are global variables initialized earlier
+    global client_models, server_model, client_optimizers, server_optimizer, criterion
+
+    # prepare reference samples & initial KDE data
+    ref_samples = sample_reference_data_per_label(train_ds, num_samples_per_label)
+
+    if KL_ESTIMATOR == "kde":
+        ref_data = compute_ref_kde_data(client_models[0], ref_samples)
+    else:
+        ref_data = compute_ref_hist_data(client_models[0], ref_samples)
+
+
+
+
+    # interaction history & tracking
+    interactions = [{'alpha_p': [], 'beta_p': []} for _ in range(num_clients)]
+    client_reputation_over_rounds = [[] for _ in range(num_clients)]
+    test_acc = []
+    latency = []
+    metrics_per_round = []
+    accepted_clients_last = []
+    centroid_shifts_history = []
+    tau_history = []
+    tau_prev = None
+    omega_history = []
+    omega_prev = None
+    prev_reps = None            # last round's reputation scores list
+    prev_accept_rate = None     # last round acceptance ratio
+    asr_history = []
+
+
+
+    state_dim = 3 * NUM_CLIENTS
+    rl_agent = RLThresholdAgentOmega(state_dim)
+
+    prev_val_acc = 0.0
+    prev_detection_rate = None
+
+    for rnd in range(rounds):
+        t0 = time.time()
+
+        # ========== DYNAMIC ATTACK: Determine attackers this round ==========
+        attackers_this_round = attack_manager.get_attackers_this_round(
+            rnd, total_rounds=rounds, prev_detection_rate=prev_detection_rate
+        )
+
+        # Create loaders with dynamic attacks applied + per-client poisoning stats
+        dynamic_loaders, poisoning_stats = create_dynamic_loaders_per_round(
+            train_ds, malicious_clients_indices, attackers_this_round,
+            flip_fraction=FLIP_FRACTION, label_pairs=LABEL_PAIRS_TO_FLIP
+        )
+
+
+        # ========== End dynamic attack setup ==========
+
+        # Step A: client KL-divergence scores (use dynamic loaders + KDE)
+        centroid_shifts = []   # now actually KL scores, but we keep the name to reuse downstream logic
+        for i in range(NUM_CLIENTS):
+            score = compute_client_anomaly_score(client_models[i], dynamic_loaders[i], ref_data)
+            centroid_shifts.append(score)
+
+
+
+
+        rep_scores = []
+        for i in range(NUM_CLIENTS):
+            if len(client_reputation_over_rounds[i]) > 0:
+                rep_scores.append(client_reputation_over_rounds[i][-1])
+            else:
+                rep_scores.append(0.0)
+
+        # --- anomaly scores pre-processing (for tau, detection, and logging) ---
+        raw_shifts = list(centroid_shifts)
+        sum_shift = max(1e-12, float(sum(raw_shifts)))
+        norm_shifts = [s / sum_shift for s in raw_shifts]
+
+        # Use a single representation everywhere (tau, detection, history)
+        shifts_for_detection = norm_shifts if USE_NORMALIZED_SHIFTS_FOR_TAU else raw_shifts
+
+        # Store the exact scores used for detection and tau
+        centroid_shifts_history.append(shifts_for_detection[:])
+
+        # Tau (static vs dynamic) on the same scale as detection
+        if USE_STATIC_TAU:
+            tau_r = float(STATIC_TAU_VALUE)
+        else:
+            tau_r = compute_dynamic_tau(
+                shifts_for_detection,
+                prev_tau=tau_prev,
+                rnd=rnd,
+                total_rounds=rounds
+            )
+
+        tau_history.append(tau_r)
+        tau_prev = tau_r
+        tau = tau_r
+
+
+        # Per-client losses (this round, on dynamic loaders)
+        client_losses = compute_client_losses(client_models, server_model, dynamic_loaders, DEVICE)
+
+        # RL state: for each client -> [normalized_shift, normalized_loss, reputation]
+        rl_state = build_rl_state_per_client(norm_shifts, client_losses, rep_scores)
+
+        omega = rl_agent.select_action(rl_state, noise=True)
+        omega_history.append(omega)
+
+
+        accepted_clients, interactions, _, reputation_scores = detect_malicious_clients(
+            shifts_for_detection,
+            interactions,
+            tau=tau,
+            omega=omega,
+            current_malicious_clients=set(attackers_this_round),
+        )
+
+        # Track detection rate for adaptive attacks (still client-level)
+        if len(attackers_this_round) > 0:
+            detected = sum(1 for c in attackers_this_round if c not in accepted_clients)
+            prev_detection_rate = detected / len(attackers_this_round)
+        else:
+            prev_detection_rate = 1.0  # No attackers, so perfect detection
+
+        # NEW: sample-level TP/FP/TN/FN using per-sample poisoning
+        round_metrics_samples = metrics_from_poisoning(poisoning_stats, accepted_clients)
+        metrics_per_round.append(round_metrics_samples)
+
+        accepted_clients_last = accepted_clients
+        for i, gamma_i in enumerate(reputation_scores):
+            client_reputation_over_rounds[i].append(gamma_i)
+
+        # Training with accepted clients
+        updated_states = []
+        for i in accepted_clients:
+            client_models[i].train(); server_model.train()
+            for x, y in dynamic_loaders[i]:  # Use dynamic_loaders!
+                x = x.to(DEVICE); y = y.to(DEVICE)
+                server_optimizer.zero_grad()
+                client_optimizers[i].zero_grad()
+                z = client_models[i](x)
+                logits = server_model(z)
+                loss = criterion(logits, y)
+                loss.backward()
+                client_optimizers[i].step()
+                server_optimizer.step()
+            updated_states.append({k: v.detach().cpu().clone() for k, v in client_models[i].state_dict().items()})
+
+        if len(updated_states) > 0:
+            avg_state = average_state_dicts(updated_states)
+            broadcast_state_dict(client_models, avg_state)
+
+        # Update reference KDE data using the new global client model
+        if KL_ESTIMATOR == "kde":
+            ref_data = compute_ref_kde_data(client_models[0], ref_samples)
+        else:
+            ref_data = compute_ref_hist_data(client_models[0], ref_samples)
+
+
+
+
+        acc = evaluate(client_models[0], server_model, test_loader)
+        test_acc.append(acc)
+        latency.append(time.time() - t0)
+        f1 = evaluate_f1_macro(client_models[0], server_model, test_loader, num_classes=10, device=DEVICE)
+
+        if ATTACK_TYPE == "backdoor":
+            asr = evaluate_backdoor_asr(
+                client_models[0], server_model, test_loader,
+                source_labels=BACKDOOR_SOURCE_LABELS,
+                target_label=BACKDOOR_TARGET_LABEL
+            )
+        else:
+            asr = 0.0
+
+        asr_history.append(asr)
+
+
+        # Compute per-client loss-based reward
+        reward = float(f1)
+
+        # After updating interactions, you already have current round reputations in `reputation_scores`
+        next_rep_scores = [float(g) for g in reputation_scores]
+
+        # Recompute losses after model update (still on dynamic loaders)
+        next_client_losses = compute_client_losses(client_models, server_model, dynamic_loaders, DEVICE)
+
+        # Use SAME normalized shifts observed this round as the "next" observation proxy
+        # (If you want true next-round shifts, you’d compute them at the start of the next loop.)
+        next_state = build_rl_state_per_client(norm_shifts, next_client_losses, next_rep_scores)
+
+
+        action_np = np.array([omega], dtype=np.float32)
+        rl_agent.store(rl_state, action_np, reward, next_state)
+        rl_agent.train()
+
+
+        print(f"Round {rnd+1:03d} | attackers={len(attackers_this_round):02d} | accepted={len(accepted_clients):02d}/{NUM_CLIENTS} | "
+            f"acc={acc*100:.2f}% | asr={asr*100:.2f}% | tau={tau:.3f} omega={omega:.3f} | reward={reward:.4f} | time={latency[-1]:.2f}s")
+
+
+    return {
+        "test_acc": test_acc,
+        "latency": latency,
+        "accepted_clients_last": accepted_clients_last,
+        "client_reputation_over_rounds": client_reputation_over_rounds,
+        "metrics_per_round": metrics_per_round,
+        "tau_history": tau_history,
+        "omega_history": omega_history,
+        "centroid_shifts_history": centroid_shifts_history,
+        "asr_history": asr_history,   # NEW
+    }
+
+
+
+

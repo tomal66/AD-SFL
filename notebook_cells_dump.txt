@@ -1,0 +1,1841 @@
+=== CELL 0 (len=7589) ===
+# %%
+# --- User-editable hyperparameters (all in one place) ---
+
+# Dataset mode: "cifar10" or "mnist"
+DATASET = "mnist"            # change to "mnist" to use the MLP on MNIST
+
+# Reference distributions (KL-divergence)
+NUM_SAMPLES_PER_LABEL = 10      # existing hyperparam (per class for global reference sampling)
+
+# --- KL-divergence anomaly detection hyperparameters (KDE version) ---
+KL_EPS = 1e-8
+KL_AGGREGATION = "mean"   # how to aggregate per-class KLs: "mean", "sum", or "max"
+
+# KDE configuration
+KDE_BANDWIDTH_MODE = "silverman"  # "silverman" (per class, from reference) or "fixed"
+KDE_BANDWIDTH = 0.2               # used only if KDE_BANDWIDTH_MODE == "fixed"
+KDE_MAX_REF_SAMPLES = 5000        # cap flattened reference activations per (class, ref) for KDE
+KDE_MAX_CLIENT_SAMPLES = 5000     # cap flattened client activations per (class, client, round)
+
+
+
+# Data / clients
+NUM_CLIENTS = 10
+IID_SPLIT = False                # if False, uses non-IID partitioning by classes
+DIRICHLET_ALPHA = 0.5   # try 0.1 (very non-IID), 0.5, 1.0, 10.0 (near IID)
+
+CLASSES_PER_CLIENT = 10         # used only when IID_SPLIT=False
+SAMPLES_PER_CLIENT = None       # None -> use full partition; set an int to cap per client
+
+# --- Dynamic attack configuration ---
+DYNAMIC_ATTACK = True           # True => malicious clients switch behavior per round
+MALICIOUS_FLIP_PROB = 0.6       # Probability that a malicious client attacks in a given round
+                                # (1-MALICIOUS_FLIP_PROB) = prob it behaves honestly
+ATTACK_PATTERN = "always"       # one of: "always", "random", "cyclic", "periodic", "adaptive"
+                                # always: malicious clients attack every round
+                                # random: i.i.d flip per round
+                                # cyclic: attack for N rounds, then honest for N rounds
+                                # periodic: attack every K rounds
+                                # adaptive: attack intensity based on detection success
+
+CYCLIC_ATTACK_PERIOD = 5        # used when ATTACK_PATTERN="cyclic" (attack 5 rounds, honest 5 rounds)
+PERIODIC_ATTACK_INTERVAL = 3    # used when ATTACK_PATTERN="periodic" (attack every 3rd round)
+
+# --- Unified Attack Type Knob ---
+# Options: "pair_flip" (your current), "backdoor", "targeted", "none"
+ATTACK_TYPE = "backdoor"
+
+# --- Backdoor attack knobs ---
+BACKDOOR_POISON_FRACTION = 1
+BACKDOOR_TARGET_LABEL = 0
+BACKDOOR_SOURCE_LABELS = [1, 2, 3]      # labels to poison -> target
+TRIGGER_SIZE = 3
+TRIGGER_POS = "br"                      # "br" or (row, col)
+
+# IMPORTANT:
+# This is RAW pixel intensity in [0,1] BEFORE normalization.
+# We'll convert this to normalized space internally.
+TRIGGER_VALUE_RAW = 1.0
+
+# --- Targeted (label-only) knobs (optional) ---
+TARGETED_POISON_FRACTION = 0.3
+TARGETED_TARGET_LABEL = 0
+TARGETED_SOURCE_LABELS = [1, 2, 3]
+
+
+# --- KL estimator knob ---
+KL_ESTIMATOR = "binning"   # "kde" or "binning"
+
+# --- Histogram-binning (only used if KL_ESTIMATOR == "binning") ---
+HIST_NUM_BINS = 60
+HIST_RANGE_MODE = "percentile"   # "percentile" or "minmax"
+HIST_RANGE_PCT = (1.0, 99.0)     # used if RANGE_MODE="percentile"
+HIST_MAX_REF_SAMPLES = 5000
+HIST_MAX_CLIENT_SAMPLES = 5000
+
+
+# Malicious behavior
+MALICIOUS_FRACTION = 0.5          # fraction of clients to poison
+FLIP_FRACTION = 1             # fraction of labels to flip within each affected class
+LABEL_PAIRS_TO_FLIP = [(1, 8), (2, 7), (3, 6)]  # class pairs for symmetric label flipping
+
+# Centinel detection (centroid-based reputation)
+TAU = 0.1                       # centroid-shift score threshold (higher than tau => negative interaction)
+OMEGA = 0.7                     # acceptance threshold on reputation gamma (>= omega => accepted)
+
+# Reference centroids
+NUM_SAMPLES_PER_LABEL = 10      # per class for global reference centroid estimation
+
+# Training
+ROUNDS = 50                     # number of communication rounds
+BATCH_SIZE = 4096
+LR_CLIENT = 1e-3
+LR_SERVER = 1e-3
+
+# Misc
+SEED = 42
+NUM_WORKERS = 0                 # dataloader workers
+DEVICE = "cuda"                 # "cuda" if GPU available, else "cpu" handled below
+
+# --------------------------------------------------------
+
+import os, random, time, math
+from typing import List, Tuple, Dict
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset, TensorDataset
+from torchvision import datasets, transforms
+
+# -------------------- PCA / interactive plotting config --------------------
+import pandas as pd
+from sklearn.decomposition import PCA
+import plotly.express as px
+
+# Choose which clients to inspect (None -> will pick automatically after poisoning)
+PCA_MALICIOUS_CLIENT = None   # if None, will pick the first malicious client from detection
+PCA_HONEST_CLIENT    = None   # if None, will pick the first non-malicious client
+
+# Which label to inspect (the "poisoned index" you care about).
+# By default pick the first pair's target class (sou
+---END---
+
+=== CELL 1 (len=5752) ===
+# %%
+# Dataset selection and transforms
+from torchvision.models import resnet18
+
+if DATASET.lower() == "cifar10":
+    # CIFAR-10 normalization
+    CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+    CIFAR10_STD  = (0.2470, 0.2435, 0.2616)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+
+    train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+
+elif DATASET.lower() == "mnist":
+    # MNIST normalization
+    MNIST_MEAN = (0.1307,)
+    MNIST_STD  = (0.3081,)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(MNIST_MEAN, MNIST_STD),
+    ])
+
+    train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    test_ds  = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+
+else:
+    raise ValueError(f"Unknown DATASET mode: {DATASET}. Use 'mnist' or 'cifar10'.")
+
+
+def make_iid_partitions(dataset, num_clients, samples_per_client=None):
+    idxs = np.arange(len(dataset))
+    np.random.shuffle(idxs)
+    parts = np.array_split(idxs, num_clients)
+    if samples_per_client is not None:
+        parts = [p[:samples_per_client] for p in parts]
+    return [Subset(dataset, p) for p in parts]
+
+
+def make_noniid_partitions_by_class(dataset, num_clients, classes_per_client=2, samples_per_client=None):
+    # Both CIFAR-10 and MNIST have labels 0..9 stored in `targets`
+    if isinstance(dataset.targets, list):
+        labels = np.array(dataset.targets)
+    else:
+        labels = np.asarray(dataset.targets)
+
+    class_to_idxs = {c: np.where(labels == c)[0] for c in range(10)}
+    for c in class_to_idxs:
+        np.random.shuffle(class_to_idxs[c])
+
+    parts = []
+    for _ in range(num_clients):
+        chosen = np.random.choice(10, classes_per_client, replace=False)
+        collect = []
+        per_class = len(dataset) // (num_clients * classes_per_client)
+        per_class = max(per_class, 1)
+        for c in chosen:
+            take = class_to_idxs[c][:per_class]
+            class_to_idxs[c] = class_to_idxs[c][per_class:]
+            collect.append(take)
+        idxs = np.concatenate(collect)
+        if samples_per_client is not None:
+            idxs = idxs[:samples_per_client]
+        parts.append(Subset(dataset, idxs))
+    return parts
+
+def make_dirichlet_partitions(
+    dataset,
+    num_clients,
+    alpha=0.5,
+    num_classes=10,
+    min_size=10,
+    samples_per_client=None,
+    seed=42
+):
+    """
+    Dirichlet-based non-IID split.
+
+    alpha small  -> more skew (more non-IID)
+    alpha large  -> closer to IID
+
+    Returns: list of Subset(dataset, indices)
+    """
+    rng = np.random.default_rng(seed)
+
+    # get labels
+    if isinstance(dataset.targets, list):
+        labels = np.array(dataset.targets)
+    else:
+        labels = np.asarray(dataset.targets)
+
+    idx_by_class = [np.where(labels == k)[0] for k in range(num_classes)]
+    for k in range(num_classes):
+        rng.shuffle(idx_by_class[k])
+
+    # keep sampling until every client has at least `min_size` samples
+    while True:
+        client_idxs = [[] for _ in range(num_clients)]
+
+        for k in range(num_classes):
+            idx_k = idx_by_class[k]
+            if len(idx_k) == 0:
+                continue
+
+            # Dirichlet proportions for this class across clients
+            proportions = rng.dirichlet(alpha * np.ones(num_clients))
+
+            # convert proportions to split sizes
+            split_sizes = (proportions * len(idx_k)).astype(int)
+
+            # fix rounding so total matches
+            diff = len(idx_k) - split_sizes.sum()
+            if diff > 0:
+                # add leftover to the largest proportion clients
+                for i in np.argsort(proportions)[-diff:]:
+                    split_sizes[i] += 1
+            elif diff < 0:
+                # remove extras from the largest split sizes (safe-guard)
+                for i in np.argsort(split_sizes)[diff:]:
+                    if split_sizes[i] > 0:
+                        split_sizes[i] -= 1
+
+            start = 0
+            for c in range(num_clients):
+                take = split_sizes[c]
+                if take > 0:
+                    client_idxs[c].extend(idx_k[start:start + take].tolist())
+                    start += take
+
+        sizes = [len(ci) for ci in client_idxs]
+        if min(sizes) >= min_size:
+            break
+
+    # optional cap per client
+    parts = []
+    for c in range(num_clients):
+        idxs = np.array(client_idxs[c])
+        rng.shuffle(idxs)
+        if samples_per_client is not None:
+            idxs = idxs[:samples_per_client]
+        parts.append(Subset(dataset, idxs))
+
+    return parts
+
+
+
+if IID_SPLIT:
+    client_datasets = make_iid_partitions(train_ds, NUM_CLIENTS, SAMPLES_PER_CLIENT)
+else:
+    client_datasets = make_dirichlet_partitions(
+      
+---END---
+
+=== CELL 2 (len=4298) ===
+def _trigger_value_normalized(trigger_value_raw: float):
+    """
+    Convert raw [0,1] pixel value to normalized value used by your dataset transform.
+    Returns either a float (MNIST) or a torch tensor [C] (CIFAR).
+    """
+    if DATASET.lower() == "cifar10":
+        mean = torch.tensor(CIFAR10_MEAN, dtype=torch.float32)
+        std  = torch.tensor(CIFAR10_STD, dtype=torch.float32)
+        v = (trigger_value_raw - mean) / std
+        return v  # shape [3]
+    else:  # mnist
+        mean = float(MNIST_MEAN[0])
+        std  = float(MNIST_STD[0])
+        return (float(trigger_value_raw) - mean) / std
+
+
+def stamp_trigger_chw(x_img_chw: torch.Tensor, trigger_size=3, trigger_value_raw=1.0, location="br"):
+    """
+    x_img_chw: torch tensor [C,H,W] already NORMALIZED (because your pipeline normalizes).
+    Stamps a constant trigger patch using the trigger value converted to normalized space.
+    """
+    x = x_img_chw.clone()
+    C, H, W = x.shape
+
+    if location == "br":
+        r0 = H - trigger_size
+        c0 = W - trigger_size
+    elif isinstance(location, (tuple, list)) and len(location) == 2:
+        r0, c0 = int(location[0]), int(location[1])
+    else:
+        raise ValueError("TRIGGER_POS must be 'br' or (row, col)")
+
+    r0 = max(0, min(r0, H - trigger_size))
+    c0 = max(0, min(c0, W - trigger_size))
+
+    tv = _trigger_value_normalized(trigger_value_raw)
+
+    if DATASET.lower() == "cifar10":
+        # tv is [3]; broadcast into [3, trigger_size, trigger_size]
+        tv = tv.to(x.dtype).view(C, 1, 1)
+        x[:, r0:r0 + trigger_size, c0:c0 + trigger_size] = tv
+    else:
+        # tv is scalar
+        x[:, r0:r0 + trigger_size, c0:c0 + trigger_size] = float(tv)
+
+    return x
+
+
+def apply_trigger_batch(x_batch: torch.Tensor, trigger_size=3, trigger_value_raw=1.0, trigger_location="br"):
+    """
+    x_batch: [B,C,H,W] already NORMALIZED.
+    """
+    x_bd = x_batch.clone()
+    for i in range(x_bd.size(0)):
+        x_bd[i] = stamp_trigger_chw(
+            x_bd[i],
+            trigger_size=trigger_size,
+            trigger_value_raw=trigger_value_raw,
+            location=trigger_location,
+        )
+    return x_bd
+
+
+def apply_targeted_label_attack_tensor(
+    y_data: torch.Tensor,
+    poison_fraction=0.3,
+    source_labels=None,
+    target_label=0,
+    seed=42
+):
+    """
+    Label-only targeted: pick poison_fraction of samples with y in source_labels -> set to target_label.
+    """
+    if source_labels is None or len(source_labels) == 0:
+        return y_data
+
+    rng = np.random.default_rng(seed)
+    y = y_data.clone()
+
+    src = torch.tensor(source_labels, device=y.device, dtype=y.dtype)
+    eligible = torch.where(torch.isin(y, src))[0].cpu().numpy()
+    if len(eligible) == 0:
+        return y
+
+    n_poison = int(len(eligible) * poison_fraction)
+    if n_poison <= 0:
+        return y
+
+    poison_idx = rng.choice(eligible, size=n_poison, replace=False)
+    y[torch.from_numpy(poison_idx).to(y.device)] = int(target_label)
+    return y
+
+
+def apply_backdoor_attack_tensor(
+    x_data: torch.Tensor,
+    y_data: torch.Tensor,
+    poison_fraction=0.3,
+    source_labels=None,
+    target_label=0,
+    trigger_size=3,
+    trigger_value_raw=1.0,
+    trigger_location="br",
+    seed=42,
+):
+    """
+    Backdoor: pick poison_fraction of samples with y in source_labels,
+    stamp trigger on x, relabel to target_label.
+    x_data is already normalized in your pipeline.
+    """
+    if source_labels is None or len(source_labels) == 0:
+        return x_data, y_data
+
+    rng = np.random.default_rng(seed)
+    x = x_data.clone()
+    y = y_data.clone()
+
+    src = torch.tensor(source_labels, device=y.device, dtype=y.dtype)
+    eligible = torch.where(torch.isin(y, src))[0].cpu().numpy()
+    if len(eligible) == 0:
+        return x, y
+
+    n_poison = int(len(eligible) * poison_fraction)
+    if n_poison <= 0:
+        return x, y
+
+    poison_idx = rng.choice(eligible, size=n_poison, replace=False)
+    poison_idx_t = torch.from_numpy(poison_idx).to(x.device)
+
+    # stamp + relabel
+    for idx in poison_idx_t:
+        x[idx] = stamp_trigger_chw(
+            x[idx],
+            trigger_size=trigger_size,
+            trigger_value_raw=trigger_value_raw,
+            location=trigger_location,
+        )
+        y[idx] = int(target_label)
+
+    return x, y
+
+---END---
+
+=== CELL 3 (len=2669) ===
+# %%
+def apply_label_flipping_attack_multiple_pairs_tensor(y_data: torch.Tensor, flip_fraction: float, label_pairs: List[Tuple[int,int]]):
+    y = y_data.clone()
+    for a, b in label_pairs:
+        idx_a = (y == a).nonzero(as_tuple=False).squeeze()
+        idx_b = (y == b).nonzero(as_tuple=False).squeeze()
+        if idx_a.numel() == 0 and idx_b.numel() == 0:
+            continue
+        if idx_a.numel() > 0:
+            n_a = int(idx_a.numel() * flip_fraction)
+            if n_a > 0:
+                flip_a = idx_a[torch.randperm(idx_a.numel())[:n_a]]
+                y[flip_a] = b
+        if idx_b.numel() > 0:
+            n_b = int(idx_b.numel() * flip_fraction)
+            if n_b > 0:
+                flip_b = idx_b[torch.randperm(idx_b.numel())[:n_b]]
+                y[flip_b] = a
+    return y
+
+def introduce_label_flipping_attack_to_multiple_clients(client_datasets, malicious_fraction, flip_fraction, label_pairs):
+    """
+    Important change for CIFAR-10:
+    - We *apply the dataset's transform* by iterating through each client's Subset,
+      collecting tensors (already normalized), then flip labels on the stacked tensor.
+    - This avoids accessing raw numpy arrays with channel/shape differences.
+    """
+    num_clients = len(client_datasets)
+    num_malicious = int(num_clients * malicious_fraction)
+    mal_idx = torch.randperm(num_clients)[:num_malicious].tolist()
+
+    poisoned_loaders = []
+    for i, ds in enumerate(client_datasets):
+        Xs, Ys = [], []
+        # materialize transformed tensors (respecting normalization)
+        for x, y in DataLoader(ds, batch_size=512, shuffle=False, num_workers=NUM_WORKERS):
+            Xs.append(x)
+            Ys.append(y)
+        if len(Xs) == 0:
+            poisoned_loaders.append(DataLoader(TensorDataset(torch.empty(0,3,32,32), torch.empty(0, dtype=torch.long)),
+                                               batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS))
+            continue
+
+        Xs = torch.cat(Xs, dim=0)                 # [N,3,32,32], already normalized
+        Ys = torch.cat(Ys, dim=0).long()          # [N]
+
+        if i in mal_idx:
+            Ys = apply_label_flipping_attack_multiple_pairs_tensor(Ys, flip_fraction, label_pairs)
+
+        poisoned = TensorDataset(Xs, Ys)
+        poisoned_loaders.append(DataLoader(poisoned, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS))
+
+    return poisoned_loaders, mal_idx
+
+client_loaders, malicious_clients_indices = introduce_label_flipping_attack_to_multiple_clients(
+    client_datasets, MALICIOUS_FRACTION, FLIP_FRACTION, LABEL_PAIRS_TO_FLIP
+)
+print("Malicious clients:", malicious_clients_indices)
+
+---END---
+
+=== CELL 4 (len=3502) ===
+# %% [NEW CELL] Client-wise class distribution (clean vs dynamic-poisoned per round)
+
+import numpy as np
+import pandas as pd
+import torch
+from collections import Counter
+import plotly.express as px
+
+def _get_labels_from_subset(subset):
+    """Return the original labels (clean) for a torch.utils.data.Subset."""
+    ds = subset.dataset
+    idxs = np.array(subset.indices)
+
+    if hasattr(ds, "targets"):
+        targets = ds.targets
+        if isinstance(targets, list):
+            targets = np.array(targets)
+        else:
+            targets = np.asarray(targets)
+        return targets[idxs].astype(int)
+
+    # Fallback: slow path (should rarely be needed)
+    labs = []
+    for _, y in torch.utils.data.DataLoader(subset, batch_size=512, shuffle=False, num_workers=0):
+        labs.extend(y.numpy().tolist())
+    return np.array(labs, dtype=int)
+
+def client_class_distribution_clean(client_datasets, num_classes=10):
+    """Distribution from the original (clean) labels per client."""
+    rows = []
+    for i, subset in enumerate(client_datasets):
+        y = _get_labels_from_subset(subset)
+        counts = np.bincount(y, minlength=num_classes)
+        total = counts.sum()
+        for c in range(num_classes):
+            rows.append({
+                "client": i,
+                "class": c,
+                "count": int(counts[c]),
+                "percent": float(counts[c] / max(total, 1)) * 100.0
+            })
+    return pd.DataFrame(rows)
+
+def client_class_distribution_from_loader(loaders, num_classes=10, max_batches=None):
+    """
+    Distribution from labels *actually seen in the loader* (e.g., poisoned labels).
+    max_batches can cap reading for speed; set None for full scan.
+    """
+    rows = []
+    for i, loader in enumerate(loaders):
+        counts = np.zeros(num_classes, dtype=np.int64)
+        total = 0
+        for b, (_, y) in enumerate(loader):
+            y_np = y.numpy() if isinstance(y, torch.Tensor) else np.asarray(y)
+            bc = np.bincount(y_np.astype(int), minlength=num_classes)
+            counts += bc
+            total += int(y_np.size)
+            if max_batches is not None and (b + 1) >= max_batches:
+                break
+        for c in range(num_classes):
+            rows.append({
+                "client": i,
+                "class": c,
+                "count": int(counts[c]),
+                "percent": float(counts[c] / max(total, 1)) * 100.0
+            })
+    return pd.DataFrame(rows)
+
+# --------- 1) CLEAN distribution from the partitioned Subsets ----------
+df_clean = client_class_distribution_clean(client_datasets, num_classes=10)
+display(df_clean.head(20))
+
+fig_clean = px.bar(
+    df_clean,
+    x="class",
+    y="count",
+    color="class",
+    facet_col="client",
+    facet_col_wrap=5,
+)
+fig_clean.update_layout(
+    width=1200, height=600,
+    xaxis_title="Class",
+    yaxis_title="Count",
+    legend_title_text="",
+)
+fig_clean.show()
+
+# --------- 2) (Optional) CURRENT LABEL distribution in the *current* loaders ----------
+# If you want to see distribution after poisoning in the current client_loaders:
+df_current = client_class_distribution_from_loader(client_loaders, num_classes=10, max_batches=None)
+display(df_current.head(20))
+
+fig_current = px.bar(
+    df_current,
+    x="class",
+    y="count",
+    color="class",
+    facet_col="client",
+    facet_col_wrap=5,
+)
+fig_current.update_layout(
+    width=1200, height=600,
+    xaxis_title="Class",
+    yaxis_title="Count",
+    legend_title_text="",
+)
+fig_current.show()
+
+
+---END---
+
+=== CELL 5 (len=7958) ===
+class DynamicAttackManager:
+    """
+    Manages intermittent attacks on malicious clients.
+    Tracks which clients attack in each round based on attack pattern.
+    """
+    def __init__(self, malicious_indices, attack_pattern="random", prob_flip=0.6,
+                 cyclic_period=5, periodic_interval=3):
+        self.malicious_indices = list(malicious_indices)
+        self.attack_pattern = attack_pattern
+        self.prob_flip = prob_flip
+        self.cyclic_period = cyclic_period
+        self.periodic_interval = periodic_interval
+        self.attack_history = []  # List of sets: which clients attacked each round
+
+    def get_attackers_this_round(self, rnd, total_rounds=None, prev_detection_rate=None):
+        """
+        Determine which malicious clients attack in round `rnd`.
+        Returns: list of client indices that attack this round
+        """
+        attackers = []
+
+        if self.attack_pattern == "always":
+            # All malicious clients attack every round
+            attackers = list(self.malicious_indices)
+
+        elif self.attack_pattern == "random":
+            # i.i.d. random
+            for mal_idx in self.malicious_indices:
+                if np.random.rand() < self.prob_flip:
+                    attackers.append(mal_idx)
+
+        elif self.attack_pattern == "cyclic":
+            # Attack for cyclic_period rounds, then honest for cyclic_period rounds
+            cycle_pos = rnd % (2 * self.cyclic_period)
+            if cycle_pos < self.cyclic_period:
+                attackers = list(self.malicious_indices)
+
+        elif self.attack_pattern == "periodic":
+            # Attack every periodic_interval rounds
+            if rnd % self.periodic_interval == 0:
+                attackers = list(self.malicious_indices)
+
+        elif self.attack_pattern == "adaptive":
+            # Adaptive: increase attack if detection is low, decrease if high
+            if prev_detection_rate is not None and prev_detection_rate < 0.7:
+                # Detection is failing, so attack more aggressively
+                attack_prob = min(self.prob_flip * 1.2, 1.0)
+            else:
+                attack_prob = self.prob_flip
+
+            for mal_idx in self.malicious_indices:
+                if np.random.rand() < attack_prob:
+                    attackers.append(mal_idx)
+
+        else:
+            raise ValueError(f"Unknown attack_pattern: {self.attack_pattern}")
+
+        self.attack_history.append(set(attackers))
+        return attackers
+
+
+
+def create_dynamic_loaders_per_round(
+    original_train_ds,
+    malicious_indices,
+    attackers_this_round,
+    attack_type=ATTACK_TYPE,   # NEW
+    flip_fraction=FLIP_FRACTION,
+    label_pairs=LABEL_PAIRS_TO_FLIP,
+    batch_size=BATCH_SIZE
+):
+
+    """
+    For a given round with specific attackers, create poisoned loaders.
+    Clients in attackers_this_round get label-flipped data.
+    Others get clean data.
+
+    NEW: also returns per-client poisoning stats:
+        poisoning_stats_this_round[i] = {"poisoned": int, "clean": int}
+    """
+    # Materialize all labels from the original dataset once
+    if isinstance(original_train_ds.targets, list):
+        labels = np.array(original_train_ds.targets)
+    else:
+        labels = np.asarray(original_train_ds.targets)
+
+    loaders_this_round = []
+    poisoning_stats_this_round = []
+
+    for i, ds in enumerate(client_datasets):  # Use pre-split client_datasets
+        # indices of this client's samples in the original dataset
+        idxs = np.array(ds.indices)
+        orig_Ys_np = labels[idxs]  # ground-truth labels for this client's data
+
+        # Materialize transformed tensors
+        Xs, Ys = [], []
+        for x, y in DataLoader(ds, batch_size=512, shuffle=False, num_workers=NUM_WORKERS):
+            Xs.append(x)
+            Ys.append(y)
+
+        if len(Xs) == 0:
+            # empty client
+            if DATASET.lower() == "cifar10":
+                empty_x = torch.empty(0, 3, 32, 32)
+            else:
+                empty_x = torch.empty(0, 1, 28, 28)
+            loaders_this_round.append(
+                DataLoader(
+                    TensorDataset(empty_x, torch.empty(0, dtype=torch.long)),
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=NUM_WORKERS
+                )
+            )
+            poisoning_stats_this_round.append({"poisoned": 0, "clean": 0})
+            continue
+
+        Xs = torch.cat(Xs, dim=0)
+        Ys = torch.cat(Ys, dim=0).long()
+
+        # sanity: align ground-truth labels to same length/order
+        orig_Ys = torch.from_numpy(orig_Ys_np).long()
+        assert Ys.shape[0] == orig_Ys.shape[0], "Mismatch between client labels and original labels."
+
+        # Apply attack if this client is attacking this round
+        # Apply attack if this client is attacking this round
+        if i in attackers_this_round and attack_type != "none":
+            # IMPORTANT: use orig_Ys for eligibility, not already-modified Ys
+            # so poisoni
+---END---
+
+=== CELL 6 (len=5401) ===
+# %%
+# --- Client and server models (split networks) + helpers ---
+
+class ClientNet(nn.Module):
+    """
+    Client-side subnetwork (kept light).
+
+    - MNIST: first (smaller) conv layer of a LeNet-style CNN.
+    - CIFAR-10: light front of ResNet-18 (conv1+bn1+relu+maxpool+layer1).
+    """
+    def __init__(self):
+        super().__init__()
+        if DATASET.lower() == "cifar10":
+            backbone = resnet18(weights=None)
+            self.features = nn.Sequential(
+                backbone.conv1,
+                backbone.bn1,
+                backbone.relu,
+                backbone.maxpool,
+                backbone.layer1,   # light front block
+            )
+        else:  # "mnist"
+            # LeNet-style: client keeps only the first, smaller conv layer
+            self.features = nn.Sequential(
+                nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=0),  # 28x28 -> 24x24
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2, stride=2),                # 24x24 -> 12x12
+            )
+
+    def forward(self, x):
+        return self.features(x)
+
+
+# Kept only for compatibility with earlier signature; not actually used by ServerNet now.
+EMBED_DIM = 512 if DATASET.lower() == "cifar10" else 128
+
+
+class ServerNet(nn.Module):
+    """
+    Server-side subnetwork (heavier part).
+
+    - MNIST: second conv layer + two fully connected layers (LeNet-style head).
+      Input from client: [N, 6, 12, 12].
+
+    - CIFAR-10: remaining ResNet-18 blocks (layer2–4) + avgpool + final FC head.
+      Input from client: output of (conv1+bn1+relu+maxpool+layer1).
+    """
+    def __init__(self, in_dim=EMBED_DIM, num_classes=10):
+        super().__init__()
+        if DATASET.lower() == "cifar10":
+            backbone = resnet18(weights=None)
+            # Heavy tail of ResNet-18
+            self.features = nn.Sequential(
+                backbone.layer2,
+                backbone.layer3,
+                backbone.layer4,
+                backbone.avgpool,   # output: [N, 512, 1, 1]
+            )
+            self.classifier = nn.Linear(512, num_classes)
+        else:  # "mnist"
+            # Input from client: [N, 6, 12, 12]
+            self.conv_head = nn.Sequential(
+                nn.Conv2d(6, 16, kernel_size=5, stride=1, padding=0),  # 12x12 -> 8x8
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=2, stride=2),                 # 8x8 -> 4x4
+            )
+            self.fc = nn.Sequential(
+                nn.Flatten(),                     # 16*4*4 = 256
+                nn.Linear(16 * 4 * 4, 120),
+                nn.ReLU(inplace=True),
+                nn.Linear(120, num_classes),      # final classification layer
+            )
+
+    def forward(self, z):
+        if DATASET.lower() == "cifar10":
+            x = self.features(z)
+            x = torch.flatten(x, 1)  # [N, 512]
+            out = self.classifier(x)
+            return out
+        else:  # "mnist"
+            x = self.conv_head(z)
+            out = self.fc(x)
+            return out
+
+
+def init_clients(num_clients):
+    return [ClientNet().to(DEVICE) for _ in range(num_clients)]
+
+
+# --- (Re)initialize models and optimizers ---
+
+server_model = ServerNet(in_dim=EMBED_DIM).to(DEVICE)
+client_models = init_clients(NUM_CLIENTS)
+
+client_optimizers = [torch.optim.Adam(m.parameters(), lr=LR_CLIENT) for m in client_models]
+server_optimizer = torch.optim.Adam(server_model.parameters(), lr=LR_SERVER)
+
+criterion = nn.CrossEntropyLoss()
+
+
+# --- Helper functions used by splitfed_learning_vanilla ---
+
+def average_state_dicts(state_dicts):
+    avg = {}
+    for k in state_dicts[0].keys():
+        avg[k] = sum(sd[k] for sd in state_dicts) / len(state_dicts)
+    return avg
+
+
+def broadcast_state_dict(model_list, state_dict):
+    for m in model_list:
+        m.load_state_dict(state_dict)
+
+
+@torch.no_grad()
+def evaluate(client_model, server_model, loader):
+    client_model.eval(); server_model.eval()
+    correct = total = 0
+    for x, y in loader:
+        x = x.to(DEVICE); y = y.to(DEVICE)
+        z = client_model(x)
+        logits = server_model(z)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / max(total, 1)
+
+@torch.no_grad()
+def evaluate_backdoor_asr(client_model, server_model, loader, source_labels, target_label):
+    """
+    ASR = P( model(trigger(x)) == target_label | y in source_labels )
+    Assumes loader yields (x,y) where x is already NORMALIZED.
+    """
+    client_model.eval(); server_model.eval()
+
+    src = set(int(s) for s in (source_labels or []))
+    if len(src) == 0:
+        return 0.0
+
+    total = 0
+    success = 0
+
+    for x, y in loader:
+        y_np = y.cpu().numpy()
+        mask = np.isin(y_np, list(src))
+        if not mask.any():
+            continue
+
+        x_sel = x[torch.from_numpy(mask).to(x.device)]
+        if x_sel.size(0) == 0:
+            continue
+
+        # stamp trigger (normalized-safe)
+        x_bd = apply_trigger_batch(
+    
+---END---
+
+=== CELL 7 (len=4125) ===
+# --- RLThresholdAgent (1D action for omega, 9D state with client losses) ---
+class RLThresholdAgentOmega:
+    def __init__(self, state_dim, hidden=128):
+        self.state_dim = state_dim  # Now 9D
+        self.action_dim = 1      # Only omega
+        self.device = DEVICE
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden//2), nn.ReLU(),
+            nn.Linear(hidden//2, 1), nn.Sigmoid()  # Range [0,1]
+        ).to(self.device)
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim+1, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden//2), nn.ReLU(),
+            nn.Linear(hidden//2, 1)
+        ).to(self.device)
+        self.actor_target = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden//2), nn.ReLU(),
+            nn.Linear(hidden//2, 1), nn.Sigmoid()
+        ).to(self.device)
+        self.critic_target = nn.Sequential(
+            nn.Linear(state_dim+1, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden//2), nn.ReLU(),
+            nn.Linear(hidden//2, 1)
+        ).to(self.device)
+        # Copy weights
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
+        self.memory = []
+        self.gamma = 0.995
+        self.tau_soft = 0.005
+        self.batch_size = 32
+        self.noise_scale = 0.05
+        self.step_count = 0
+
+    def select_action(self, state, noise=True):
+        with torch.no_grad():
+            x = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            action = self.actor(x).cpu().numpy()[0]
+            if noise:
+                action += self.noise_scale * np.random.normal(size=1)
+            omega_val = np.clip(action[0], 0.3, 0.95)  # Acceptable RL omega range
+            return omega_val
+
+    def store(self, s, a, r, s_):
+        self.memory.append((s, a, r, s_))
+        if len(self.memory)>2000:
+            self.memory.pop(0)
+
+    def train(self):
+        if len(self.memory)<self.batch_size: return
+        idxs = np.random.choice(len(self.memory), self.batch_size, replace=False)
+        transitions = [self.memory[i] for i in idxs]
+        states = torch.tensor([t[0] for t in transitions], dtype=torch.float32, device=self.device)
+        actions = torch.tensor([t[1] for t in transitions], dtype=torch.float32, device=self.device)
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(-1)
+        rewards = torch.tensor([t[2] for t in transitions], dtype=torch.float32, device=self.device).unsqueeze(1)
+        next_states = torch.tensor([t[3] for t in transitions], dtype=torch.float32, device=self.device)
+
+        # Critic update
+        with torch.no_grad():
+            next_actions = self.actor_target(next_states)
+            critic_target_val = self.critic_target(torch.cat([next_states, next_actions],dim=1))
+            target_q = rewards + self.gamma * critic_target_val
+        critic_q = self.critic(torch.cat([states,actions],dim=1))
+        critic_loss = F.mse_loss(critic_q, target_q)
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        self.critic_optim.step()
+
+        # Actor update (every 2nd critic update)
+        self.step_count += 1
+        if self.step_count % 2 == 0:
+            pred_actions = self.actor(states)
+            actor_loss = -self.critic(torch.cat([states,pred_actions],dim=1)).mean()
+            self.actor_optim.zero_grad()
+            actor_loss.backward()
+            self.actor_optim.step()
+
+        # Soft update
+        for tgt, src in zip(self.actor_target.parameters(), self.actor.parameters()):
+            tgt.data.mul_(1-self.tau_soft); tgt.data.add_(src.data*self.tau_soft)
+        for tgt, src in zip(self.critic_target.parameters(), self.critic.parameters()):
+            tgt.data.mul_(1-self.tau_soft); tgt.data.add_(src.data*self.tau_soft)
+
+---END---
+
+=== CELL 8 (len=449) ===
+# RL state, but ONLY for input to the omega policy (omit tau!)
+def rl_state_from_stats_omega_only(reputation_scores, prev_val_acc, round_num, total_rounds):
+    mu_r = float(np.mean(reputation_scores)) if reputation_scores else 0.0
+    sigma_r = float(np.std(reputation_scores)) if reputation_scores else 0.0
+    progress = round_num/total_rounds
+    state = [mu_r, sigma_r, prev_val_acc, progress]  # use 4D state for omega policy
+    return state
+
+---END---
+
+=== CELL 9 (len=15903) ===
+@torch.no_grad()
+def sample_reference_data_per_label(dataset, num_samples_per_label):
+    # Return dict {label: (Xs [K,1,28,28], Ys [K])}
+    label_buckets = {i: [] for i in range(10)}
+    for x, y in DataLoader(dataset, batch_size=512, shuffle=True):
+        for xi, yi in zip(x, y):
+            if len(label_buckets[int(yi)]) < num_samples_per_label:
+                label_buckets[int(yi)].append((xi, yi))
+        if all(len(label_buckets[i]) >= num_samples_per_label for i in range(10)):
+            break
+    out = {}
+    for lab in range(10):
+        if len(label_buckets[lab]) == 0:
+            continue
+        xs, ys = zip(*label_buckets[lab])
+        out[lab] = (torch.stack(xs, dim=0).to(DEVICE), torch.tensor([lab]*len(xs), device=DEVICE))
+    return out
+
+@torch.no_grad()
+def compute_ref_hist_data(client_model, ref_samples,
+                          num_bins=HIST_NUM_BINS,
+                          range_mode=HIST_RANGE_MODE,
+                          range_pct=HIST_RANGE_PCT,
+                          max_ref_samples_per_class=HIST_MAX_REF_SAMPLES,
+                          eps=KL_EPS):
+    """
+    Returns:
+      ref_hist_data[label] = {"bin_edges": np.ndarray[B+1], "p_ref": np.ndarray[B]}
+    """
+    client_model.eval()
+    ref_hist_data = {}
+
+    for lab, (xs, ys) in ref_samples.items():
+        z = client_model(xs)
+        vals = z.detach().cpu().numpy().reshape(-1).astype(np.float64)
+
+        if vals.size == 0:
+            continue
+
+        if max_ref_samples_per_class is not None and vals.size > max_ref_samples_per_class:
+            idx = np.random.choice(vals.size, max_ref_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        if range_mode == "percentile":
+            lo, hi = np.percentile(vals, list(range_pct))
+        else:
+            lo, hi = float(vals.min()), float(vals.max())
+
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            lo, hi = float(vals.min()), float(vals.max() + 1e-6)
+
+        bin_edges = np.linspace(lo, hi, num_bins + 1)
+
+        counts, _ = np.histogram(vals, bins=bin_edges)
+        p_ref = counts.astype(np.float64) + eps
+        p_ref = p_ref / p_ref.sum()
+
+        ref_hist_data[int(lab)] = {"bin_edges": bin_edges, "p_ref": p_ref}
+
+    return ref_hist_data
+
+
+
+@torch.no_grad()
+def compute_ref_kde_data(client_model, ref_samples, max_ref_samples_per_class=KDE_MAX_REF_SAMPLES):
+    """
+    For each label k in ref_samples, compute and store:
+      - flattened activation values (1D) from the reference set
+      - a KDE bandwidth h_k (either fixed or via Silverman's rule)
+
+    Returns:
+      ref_kde_data: {label: {"values": np.ndarray, "bandwidth": float}}
+    """
+    client_model.eval()
+    ref_kde_data = {}
+
+    for lab, (xs, ys) in ref_samples.items():
+        # xs already on DEVICE
+        z = client_model(xs)  # [K, D]
+        vals = z.detach().cpu().numpy().reshape(-1).astype(np.float64)  # 1D
+
+        if vals.size == 0:
+            continue
+
+        # Optional subsampling for efficiency
+        if max_ref_samples_per_class is not None and vals.size > max_ref_samples_per_class:
+            idx = np.random.choice(vals.size, max_ref_samples_per_class, replace=False)
+            vals = vals[idx]
+
+        # Bandwidth selection
+        if KDE_BANDWIDTH_MODE == "fixed":
+            h = float(KDE_BANDWIDTH)
+        else:
+            # Silverman's rule-of-thumb on reference vals
+            std = float(np.std(vals))
+            q75, q25 = np.percentile(vals, [75, 25])
+            iqr = float(q75 - q25)
+            if std <= 0 and iqr <= 0:
+                sigma = 1.0  # fallback
+            else:
+                sigma = min(std, iqr / 1.34) if (std > 0 and iqr > 0) else max(std, iqr / 1.34)
+            n = max(1, vals.size)
+            h = 0.9 * sigma * (n ** (-1.0 / 5.0)) if n > 1 else 1.0
+
+        ref_kde_data[int(lab)] = {
+            "values": vals,
+            "bandwidth": max(h, 1e-6),  # avoid degenerate h
+        }
+
+    return ref_kde_data
+
+
+def gaussian_kde_logpdf_loo(samples, h, eps=KL_EPS):
+    """
+    Leave-one-out log-density for points equal to the KDE basis itself.
+
+    samples: np.ndarray [N] (evaluation points == basis points)
+    h: scalar bandwidth
+    returns: np.ndarray [N] where each entry is log p_{-i}(x_i)
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    N = samples.size
+    if N < 2:
+        return np.full((N,), np.log(eps), dtype=np.float64)
+
+    h = float(max(h, 1e-6))
+
+    # diff [N, N]
+    diff = (samples[:, None] - samples[None, :]) / h
+    exponent = -0.5 * diff * diff
+
+    # stable log-sum-exp per row
+    max_exp = np.max(exponent, axis=1, keepdims=True)
+    exp_shifted = np.exp(exponent - max_exp)
+
+    # leave-one-out: subtract self-kernel term exp(0)=1 from each row sum
+    row_sum = exp_shifted.sum(axis=1) - 1.0
+    row_sum = np.maximum(row_sum, 1e-300)  # avoid log(0)
+
+    log_sum = max_exp.squeeze(-1) + np.log(row_sum)
+
+    # normalization: (N-1) kernels
+    log_norm = np.log(N - 1) + np.
+---END---
+
+=== CELL 10 (len=1493) ===
+def average_state_dicts(state_dicts):
+    avg = {}
+    for k in state_dicts[0].keys():
+        avg[k] = sum(sd[k] for sd in state_dicts) / len(state_dicts)
+    return avg
+
+def broadcast_state_dict(model_list, state_dict):
+    for m in model_list:
+        m.load_state_dict(state_dict)
+
+@torch.no_grad()
+def evaluate(client_model, server_model, loader):
+    client_model.eval(); server_model.eval()
+    correct = total = 0
+    for x, y in loader:
+        x = x.to(DEVICE); y = y.to(DEVICE)
+        z = client_model(x)
+        logits = server_model(z)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+    return correct / max(total, 1)
+
+@torch.no_grad()
+def evaluate_f1_macro(client_model, server_model, loader, num_classes=10, device=DEVICE, eps=1e-12):
+    client_model.eval(); server_model.eval()
+
+    cm = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    for x, y in loader:
+        x = x.to(device); y = y.to(device)
+        z = client_model(x)
+        logits = server_model(z)
+        pred = logits.argmax(dim=1)
+
+        for t, p in zip(y.view(-1), pred.view(-1)):
+            cm[int(t), int(p)] += 1
+
+    tp = cm.diag().to(torch.float32)
+    fp = cm.sum(dim=0).to(torch.float32) - tp
+    fn = cm.sum(dim=1).to(torch.float32) - tp
+
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    return float(f1.mean().item())  # macro-F1
+
+
+
+---END---
+
+=== CELL 11 (len=1188) ===
+@torch.no_grad()
+def compute_client_features_for_label(client_model, loader, target_label, max_samples=None):
+    """
+    Return (features_np [N,D], labels_np [N]) for samples whose (local) label == target_label.
+    Caps to max_samples if provided.
+    """
+    client_model.eval()
+    feats = []
+    labs = []
+    seen = 0
+    for x, y in loader:
+        # x: already transformed tensors; y are labels (possibly poisoned)
+        mask = (y == target_label)
+        if mask.any():
+            x_sel = x[mask]
+            if x_sel.size(0) == 0:
+                continue
+            z = client_model(x_sel.to(DEVICE))  # [k, dim]
+            feats.append(z.cpu())
+            labs.append(y[mask].cpu())
+            seen += z.size(0)
+            if max_samples is not None and seen >= max_samples:
+                break
+    if len(feats) == 0:
+        return np.zeros((0, next(iter(client_model.parameters())).shape[0])), np.array([], dtype=int)
+    feats = torch.cat(feats, dim=0).numpy()
+    labs = torch.cat(labs, dim=0).numpy()
+    if max_samples is not None and feats.shape[0] > max_samples:
+        feats = feats[:max_samples]
+        labs  = labs[:max_samples]
+    return feats, labs
+
+---END---
+
+=== CELL 12 (len=7472) ===
+def optimal_fisher_threshold(
+    shifts,
+    n_candidates=100,
+    use_guard=USE_FISHER_GUARD,
+    min_ratio=FISHER_MIN_RATIO,
+    min_sep_std=FISHER_MIN_SEP_STD,
+    max_unimodal_cv=FISHER_MAX_UNIMODAL_CV,
+    fallback_mode=FISHER_FALLBACK_MODE,
+    fallback_percentile=FISHER_FALLBACK_PERCENTILE,
+):
+    """
+    Fisher's ratio-based threshold selection, with safety guards.
+
+    If the distribution looks essentially unimodal (tight cluster),
+    or the best Fisher split is weak, we fall back to a conservative
+    threshold (MAD / percentile / max) instead of trusting Fisher.
+    """
+    shifts = np.asarray(shifts, dtype=float)
+    if shifts.size < 4:
+        return float(np.median(shifts))
+
+    # --- Global compactness: are all shifts just a tight blob? ---
+    mean_all = float(shifts.mean())
+    std_all = float(shifts.std() + 1e-8)
+    cv_all = std_all / (abs(mean_all) + 1e-8)  # coefficient of variation
+
+    # If the distribution is extremely tight, don't even bother splitting
+    if use_guard and cv_all < max_unimodal_cv:
+        return _fisher_fallback_threshold(shifts, fallback_mode, fallback_percentile)
+
+    # --- Standard Fisher grid search ---
+    candidates = np.linspace(shifts.min(), shifts.max(), n_candidates)
+    best_ratio = -1.0
+    best_tau = float(np.median(shifts))
+    best_sep_std_units = 0.0
+
+    for tau in candidates:
+        below = shifts[shifts <= tau]
+        above = shifts[shifts > tau]
+
+        if below.size < 2 or above.size < 2:
+            continue
+
+        mu_1, std_1 = below.mean(), below.std() + 1e-8
+        mu_2, std_2 = above.mean(), above.std() + 1e-8
+
+        denom = std_1**2 + std_2**2 + 1e-8
+        fisher = (mu_2 - mu_1) ** 2 / denom
+
+        if fisher > best_ratio:
+            best_ratio = fisher
+            best_tau = float(tau)
+            pooled_std = math.sqrt(denom)
+            best_sep_std_units = abs(mu_2 - mu_1) / (pooled_std + 1e-8)
+
+    # --- Guard: if best split is weak, don't use Fisher ---
+    if use_guard:
+        weak_ratio = best_ratio < min_ratio
+        weak_sep = best_sep_std_units < min_sep_std
+
+        if weak_ratio or weak_sep:
+            return _fisher_fallback_threshold(shifts, fallback_mode, fallback_percentile)
+
+    return float(best_tau)
+
+
+def _fisher_fallback_threshold(shifts, mode, percentile):
+    """
+    Conservative tau when Fisher is not trustworthy.
+    """
+    print("Fallback..")
+    shifts = np.asarray(shifts, dtype=float)
+    if mode == "mad":
+        med = float(np.median(shifts))
+        mad = float(np.median(np.abs(shifts - med))) + 1e-12
+        return med + TAU_MAD_K * mad
+    elif mode == "percentile":
+        return float(np.percentile(shifts, percentile))
+    elif mode == "max":
+        # essentially: don't flag anyone as malicious
+        return float(shifts.max() + 1e-6)
+    else:
+        # default: median
+        return float(np.median(shifts))
+
+
+
+
+
+def kde_valley_threshold(shifts, bw='scott'):
+    """
+    KDE-based valley detection threshold.
+    Fits a 1D KDE to centroid shifts and picks the first local minimum
+    between the 'honest' and 'malicious' modes. Falls back to a
+    percentile-based threshold if no valley is found.
+    """
+    from scipy.stats import gaussian_kde
+
+    shifts = np.asarray(shifts, dtype=float)
+    if shifts.size == 0:
+        return 0.0
+    if np.allclose(shifts.min(), shifts.max()):
+        # All identical -> no separation possible
+        return float(shifts[0])
+
+    kde = gaussian_kde(shifts, bw_method=bw)
+    x_eval = np.linspace(shifts.min(), shifts.max(), 1000)
+    density = kde(x_eval)
+
+    valleys = []
+    for i in range(1, len(density) - 1):
+        if density[i] < density[i - 1] and density[i] < density[i + 1]:
+            valleys.append(x_eval[i])
+
+    if valleys:
+        # First valley (closest to 'honest' region)
+        return float(valleys[0])
+    else:
+        # Fallback: moderately conservative percentile
+        return float(np.percentile(shifts, 60))
+
+
+def compute_dynamic_tau(centroid_shifts, prev_tau, rnd, total_rounds):
+    """
+    Returns a tau for this round based on TAU_MODE and the current centroid_shifts.
+
+    Supported TAU_MODE values:
+    - "percentile": tau = percentile(centroid_shifts, TAU_PERCENTILE)
+    - "mad":        tau = median + TAU_MAD_K * MAD
+    - "ema":        tau = EMA over round means of centroid_shifts
+    - "linear":     tau linearly decays from TAU_LINEAR_START to TAU_LINEAR_END
+    - "fisher":     tau from Fisher's ratio maximization (1D split)
+    - "kde":        tau from KDE valley detection
+    """
+    arr = np.asarray(centroid_shifts, dtype=float)
+
+    # Print
+    print("centroid_shifts:", centroid_shifts)
+
+    if arr.size == 0:
+        return prev_tau if prev_tau is not None else TAU  # fallback
+
+    # --- New methods ---
+    if TAU_MODE == "fisher":
+      return optimal_fisher_threshold(arr)
+
+    if TAU_MODE == "kde":
+        return kde_valley_threshold(arr)
+
+    # --- Existing methods ---
+    if TAU_MODE == "percentile":
+        return fl
+---END---
+
+=== CELL 13 (len=3513) ===
+def aggregate_reward_from_losses(client_losses, accepted_clients, num_clients, loss_weight=1.0):
+    """
+    Compute reward signal from per-client losses.
+
+    Returns a composite reward:
+    - Penalizes high loss (malicious clients have high loss)
+    - Incentivizes accepting low-loss clients
+
+    reward = -mean(losses[accepted_clients]) + accuracy_bonus
+    """
+    if len(accepted_clients) == 0:
+        return -1.0  # Penalty for accepting no clients
+
+    accepted_losses = [client_losses[i] for i in accepted_clients]
+    mean_loss = np.mean(accepted_losses)
+
+    # Negative mean loss (we maximize reward, so lower loss = higher reward)
+    # Scale by loss_weight to tune sensitivity
+    reward = -loss_weight * mean_loss
+
+    # Bonus for having reasonable diversity (not too few clients)
+    min_accept_ratio = max(0.2, 1.0 / max(num_clients, 1))
+    accept_ratio = len(accepted_clients) / max(num_clients, 1)
+    if accept_ratio < min_accept_ratio:
+        reward -= 0.5  # Penalize extreme rejection
+
+    return float(reward)
+
+
+def compute_state_from_client_losses(client_losses, accepted_clients, reputation_scores,
+                                     prev_val_acc, round_num, total_rounds, num_clients):
+    """
+    Extended RL state including per-client loss statistics.
+
+    State = [mu_rep, sigma_rep, mu_loss_accepted, sigma_loss_accepted,
+             max_loss_accepted, min_loss_accepted, prev_acc, progress, accept_ratio]
+
+    Dimension: 9D
+    """
+    # Reputation statistics
+    mu_r = float(np.mean(reputation_scores)) if reputation_scores else 0.0
+    sigma_r = float(np.std(reputation_scores)) if reputation_scores else 0.0
+
+    # Loss statistics for accepted clients
+    if len(accepted_clients) > 0:
+        accepted_losses = np.array([client_losses[i] for i in accepted_clients])
+        mu_loss = float(np.mean(accepted_losses))
+        sigma_loss = float(np.std(accepted_losses))
+        max_loss = float(np.max(accepted_losses))
+        min_loss = float(np.min(accepted_losses))
+    else:
+        mu_loss = sigma_loss = max_loss = min_loss = 0.0
+
+    progress = round_num / max(total_rounds, 1)
+    accept_ratio = len(accepted_clients) / max(num_clients, 1)
+
+    # 9D state vector
+    state = [
+        mu_r,               # 0: mean reputation
+        sigma_r,            # 1: std reputation
+        mu_loss,            # 2: mean loss (accepted clients)
+        sigma_loss,         # 3: std loss (accepted clients)
+        max_loss,           # 4: max loss (accepted clients)
+        min_loss,           # 5: min loss (accepted clients)
+        prev_val_acc,       # 6: previous validation accuracy
+        progress,           # 7: training progress (0 to 1)
+        accept_ratio        # 8: acceptance ratio (0 to 1)
+    ]
+
+    return state
+
+def build_rl_state_per_client(norm_shifts, client_losses_dict, rep_scores, eps=1e-12):
+    """
+    norm_shifts: list/np array length N (already normalized to sum=1)
+    client_losses_dict: {i: loss_i}
+    rep_scores: list length N (gamma_i or last-known rep)
+
+    Returns: np.ndarray shape (3N,)
+    """
+    N = len(norm_shifts)
+    losses = np.array([float(client_losses_dict[i]) for i in range(N)], dtype=np.float32)
+    mean_loss = float(losses.mean()) + eps
+    losses_norm = losses / mean_loss
+
+    reps = np.array([float(rep_scores[i]) for i in range(N)], dtype=np.float32)
+
+    s = []
+    for i in range(N):
+        s.extend([float(norm_shifts[i]), float(losses_norm[i]), float(reps[i])])
+
+    return np.array(s, dtype=np.float32)
+
+
+---END---
+
+=== CELL 14 (len=802) ===
+@torch.no_grad()
+def compute_client_losses(client_models, server_model, client_loaders, device):
+    """
+    Compute validation loss for each client on their own data.
+    Returns dict: {client_idx: avg_loss}
+    """
+    losses = {}
+    criterion = nn.CrossEntropyLoss()
+
+    for i in range(len(client_models)):
+        client_models[i].eval()
+        server_model.eval()
+        total_loss = 0.0
+        count = 0
+
+        for x, y in client_loaders[i]:
+            x = x.to(device)
+            y = y.to(device)
+            z = client_models[i](x)
+            logits = server_model(z)
+            loss = criterion(logits, y)
+            total_loss += loss.item() * x.size(0)
+            count += x.size(0)
+
+        avg_loss = total_loss / max(count, 1)
+        losses[i] = avg_loss
+
+    return losses
+
+---END---
+
+=== CELL 15 (len=8696) ===
+
+
+def splitfed_learning_exclude_malicious(client_loaders, test_loader, rounds=ROUNDS, tau=TAU, omega=OMEGA, num_samples_per_label=NUM_SAMPLES_PER_LABEL, current_malicious_clients=None):
+
+    # Initialize dynamic attack manager
+    attack_manager = DynamicAttackManager(
+        malicious_indices=malicious_clients_indices,
+        attack_pattern=ATTACK_PATTERN,
+        prob_flip=MALICIOUS_FLIP_PROB,
+        cyclic_period=CYCLIC_ATTACK_PERIOD,
+        periodic_interval=PERIODIC_ATTACK_INTERVAL
+    )
+
+    num_clients = len(client_loaders)
+    # models & optimizers are global variables initialized earlier
+    global client_models, server_model, client_optimizers, server_optimizer, criterion
+
+    # prepare reference samples & initial KDE data
+    ref_samples = sample_reference_data_per_label(train_ds, num_samples_per_label)
+
+    if KL_ESTIMATOR == "kde":
+        ref_data = compute_ref_kde_data(client_models[0], ref_samples)
+    else:
+        ref_data = compute_ref_hist_data(client_models[0], ref_samples)
+
+
+
+
+    # interaction history & tracking
+    interactions = [{'alpha_p': [], 'beta_p': []} for _ in range(num_clients)]
+    client_reputation_over_rounds = [[] for _ in range(num_clients)]
+    test_acc = []
+    latency = []
+    metrics_per_round = []
+    accepted_clients_last = []
+    centroid_shifts_history = []
+    tau_history = []
+    tau_prev = None
+    omega_history = []
+    omega_prev = None
+    prev_reps = None            # last round's reputation scores list
+    prev_accept_rate = None     # last round acceptance ratio
+    asr_history = []
+
+
+
+    state_dim = 3 * NUM_CLIENTS
+    rl_agent = RLThresholdAgentOmega(state_dim)
+
+    prev_val_acc = 0.0
+    prev_detection_rate = None
+
+    for rnd in range(rounds):
+        t0 = time.time()
+
+        # ========== DYNAMIC ATTACK: Determine attackers this round ==========
+        attackers_this_round = attack_manager.get_attackers_this_round(
+            rnd, total_rounds=rounds, prev_detection_rate=prev_detection_rate
+        )
+
+        # Create loaders with dynamic attacks applied + per-client poisoning stats
+        dynamic_loaders, poisoning_stats = create_dynamic_loaders_per_round(
+            train_ds, malicious_clients_indices, attackers_this_round,
+            flip_fraction=FLIP_FRACTION, label_pairs=LABEL_PAIRS_TO_FLIP
+        )
+
+
+        # ========== End dynamic attack setup ==========
+
+        # Step A: client KL-divergence scores (use dynamic loaders + KDE)
+        centroid_shifts = []   # now actually KL scores, but we keep the name to reuse downstream logic
+        for i in range(NUM_CLIENTS):
+            score = compute_client_anomaly_score(client_models[i], dynamic_loaders[i], ref_data)
+            centroid_shifts.append(score)
+
+
+
+
+        rep_scores = []
+        for i in range(NUM_CLIENTS):
+            if len(client_reputation_over_rounds[i]) > 0:
+                rep_scores.append(client_reputation_over_rounds[i][-1])
+            else:
+                rep_scores.append(0.0)
+
+        # --- anomaly scores pre-processing (for tau, detection, and logging) ---
+        raw_shifts = list(centroid_shifts)
+        sum_shift = max(1e-12, float(sum(raw_shifts)))
+        norm_shifts = [s / sum_shift for s in raw_shifts]
+
+        # Use a single representation everywhere (tau, detection, history)
+        shifts_for_detection = norm_shifts if USE_NORMALIZED_SHIFTS_FOR_TAU else raw_shifts
+
+        # Store the exact scores used for detection and tau
+        centroid_shifts_history.append(shifts_for_detection[:])
+
+        # Tau (static vs dynamic) on the same scale as detection
+        if USE_STATIC_TAU:
+            tau_r = float(STATIC_TAU_VALUE)
+        else:
+            tau_r = compute_dynamic_tau(
+                shifts_for_detection,
+                prev_tau=tau_prev,
+                rnd=rnd,
+                total_rounds=rounds
+            )
+
+        tau_history.append(tau_r)
+        tau_prev = tau_r
+        tau = tau_r
+
+
+        # Per-client losses (this round, on dynamic loaders)
+        client_losses = compute_client_losses(client_models, server_model, dynamic_loaders, DEVICE)
+
+        # RL state: for each client -> [normalized_shift, normalized_loss, reputation]
+        rl_state = build_rl_state_per_client(norm_shifts, client_losses, rep_scores)
+
+        omega = rl_agent.select_action(rl_state, noise=True)
+        omega_history.append(omega)
+
+
+        accepted_clients, interactions, _, reputation_scores = detect_malicious_clients(
+            shifts_for_detection,
+            interactions,
+            tau=tau,
+            omega=omega,
+            current_malicious_clients=set(attackers_this_round),
+        )
+
+        # Track detection rate for adaptive attacks (still client-level)
+        if len(attackers_this_round) > 0:
+            detected = sum(1 for c in attackers_this_round if c not in accepted_clients)
+            prev_detection_rate = detected / len(attackers_this_round)
+        else:
+            prev_detection_rate = 1.0  # No attackers, so perfect det
+---END---
+
+=== CELL 16 (len=234) ===
+results = splitfed_learning_exclude_malicious(
+    client_loaders, test_loader,
+    rounds=ROUNDS, tau=TAU, omega=OMEGA,
+    num_samples_per_label=NUM_SAMPLES_PER_LABEL,
+    current_malicious_clients=set(malicious_clients_indices)
+)
+
+
+---END---
+
+=== CELL 17 (len=439) ===
+# # Summarize detection metrics
+TP = sum(m['TP'] for m in results['metrics_per_round'])
+TN = sum(m['TN'] for m in results['metrics_per_round'])
+FP = sum(m['FP'] for m in results['metrics_per_round'])
+FN = sum(m['FN'] for m in results['metrics_per_round'])
+total = TP + TN + FP + FN + 1e-12
+TPR = TP/total; FPR = FP/total; TNR = TN/total; FNR = FN/total
+print(f"Detection Summary -> TPR:{TPR:.4f} FPR:{FPR:.4f} TNR:{TNR:.4f} FNR:{FNR:.4f}")
+---END---
+
+=== CELL 18 (len=1318) ===
+# %%
+import numpy as np
+import pandas as pd
+import plotly.express as px
+
+# Option: if your detection uses *normalized* shifts, set this True to plot those instead.
+USE_NORMALIZED_SHIFTS_FOR_PLOT = False
+
+tau_hist = np.asarray(results["tau_history"], dtype=float)
+shifts_hist = results["centroid_shifts_history"]  # already on the same scale used for detection & tau
+
+R = len(shifts_hist)
+N = len(shifts_hist[0]) if R > 0 else 0
+
+# Build a tidy DataFrame: one row per (round, client)
+rows = []
+for r in range(R):
+    sr = np.asarray(shifts_hist[r], dtype=float)
+    for j in range(len(sr)):
+        rows.append({"round": r, "client": j, "value": float(sr[j]), "kind": "shift"})
+
+
+# Add a single τ line (duplicate per client=False; we’ll add as separate trace)
+df_shifts = pd.DataFrame(rows)
+
+fig = px.line(
+    df_shifts,
+    x="round",
+    y="value",
+    color="client",
+    hover_data=["client"],
+)
+
+# Overlay τ as a dashed line
+fig.add_scatter(
+    x=list(range(R)),
+    y=tau_hist[:R].tolist(),
+    mode="lines",
+    name="tau",
+    line=dict(dash="dash", width=3),
+)
+
+# Styling (no title to match your preference)
+fig.update_layout(
+    width=900, height=600,
+    legend_title_text="",
+    xaxis_title="Round",
+    yaxis_title="Anomaly score",
+)
+
+print("Malicious clients:", malicious_clients_indices)
+
+fig.show()
+
+---END---
+
+=== CELL 19 (len=1004) ===
+# %%
+import numpy as np
+import pandas as pd
+import plotly.express as px
+
+omega_hist = np.asarray(results["omega_history"], dtype=float)
+reps_per_client = results["client_reputation_over_rounds"]  # list of N lists (≈R long)
+
+# Determine R as the max length we have across clients
+N = len(reps_per_client)
+R = max((len(a) for a in reps_per_client), default=0)
+
+rows = []
+for j, arr in enumerate(reps_per_client):
+    for r, g in enumerate(arr):
+        rows.append({"round": r, "client": j, "value": float(g), "kind": "reputation"})
+
+df_rep = pd.DataFrame(rows)
+
+fig = px.line(
+    df_rep,
+    x="round",
+    y="value",
+    color="client",
+    hover_data=["client"],
+)
+
+# Overlay ω as dashed line
+fig.add_scatter(
+    x=list(range(min(R, len(omega_hist)))),
+    y=omega_hist[:R].tolist(),
+    mode="lines",
+    name="omega",
+    line=dict(dash="dash", width=3),
+)
+
+fig.update_layout(
+    width=900, height=600,
+    legend_title_text="",
+    xaxis_title="Round",
+    yaxis_title="Reputation",
+)
+fig.show()
+
+---END---
+
+=== CELL 20 (len=2002) ===
+# %%
+import json
+import os
+from datetime import datetime
+import numpy as np
+
+class NumpyEncoder(json.JSONEncoder):
+    """ Special json encoder for numpy types """
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+# 1. Gather Hyperparameters for reproducibility
+experiment_config = {
+    "DATASET": DATASET,
+    "NUM_CLIENTS": NUM_CLIENTS,
+    "ROUNDS": ROUNDS,
+    "IID_SPLIT": IID_SPLIT,
+    
+    # --- Attack Config ---
+    "MALICIOUS_FRACTION": MALICIOUS_FRACTION,  # Malicious Rate
+    "FLIP_FRACTION": FLIP_FRACTION,            # Flip Rate
+    "ATTACK_PATTERN": ATTACK_PATTERN,
+    "DYNAMIC_ATTACK": DYNAMIC_ATTACK,
+    "MALICIOUS_CLIENTS_INDICES": malicious_clients_indices if isinstance(malicious_clients_indices, list) else list(malicious_clients_indices),
+
+    # --- Defense Config ---
+    "TAU_MODE": TAU_MODE,
+    "OMEGA_MODE": OMEGA_MODE,
+    "SEED": SEED,
+}
+
+experiment_config.update({
+    "ATTACK_TYPE": ATTACK_TYPE,
+    "BACKDOOR_ATTACK": BACKDOOR_ATTACK,
+    "BACKDOOR_POISON_FRACTION": BACKDOOR_POISON_FRACTION,
+    "BACKDOOR_TARGET_LABEL": BACKDOOR_TARGET_LABEL,
+    "BACKDOOR_SOURCE_LABELS": BACKDOOR_SOURCE_LABELS,
+    "TRIGGER_SIZE": TRIGGER_SIZE,
+    "TRIGGER_POS": TRIGGER_POS,
+    "TRIGGER_VALUE_RAW": TRIGGER_VALUE_RAW,
+})
+
+
+# 2. Prepare the final dictionary
+output_data = {
+    "config": experiment_config,
+    "results": results
+}
+
+# 3. Generate a descriptive filename with timestamp
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"results_{DATASET}_{TAU_MODE}_M{MALICIOUS_FRACTION}_F{FLIP_FRACTION}_{timestamp}.json"
+
+# 4. Save to JSON
+with open(filename, 'w') as f:
+    json.dump(output_data, f, cls=NumpyEncoder, indent=4)
+
+print(f"✅ Results and config successfully saved to: {os.path.abspath(filename)}")
+---END---
+

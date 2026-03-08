@@ -1,0 +1,222 @@
+def optimal_fisher_threshold(
+    shifts,
+    n_candidates=100,
+    use_guard=USE_FISHER_GUARD,
+    min_ratio=FISHER_MIN_RATIO,
+    min_sep_std=FISHER_MIN_SEP_STD,
+    max_unimodal_cv=FISHER_MAX_UNIMODAL_CV,
+    fallback_mode=FISHER_FALLBACK_MODE,
+    fallback_percentile=FISHER_FALLBACK_PERCENTILE,
+):
+    """
+    Fisher's ratio-based threshold selection, with safety guards.
+
+    If the distribution looks essentially unimodal (tight cluster),
+    or the best Fisher split is weak, we fall back to a conservative
+    threshold (MAD / percentile / max) instead of trusting Fisher.
+    """
+    shifts = np.asarray(shifts, dtype=float)
+    if shifts.size < 4:
+        return float(np.median(shifts))
+
+    # --- Global compactness: are all shifts just a tight blob? ---
+    mean_all = float(shifts.mean())
+    std_all = float(shifts.std() + 1e-8)
+    cv_all = std_all / (abs(mean_all) + 1e-8)  # coefficient of variation
+
+    # If the distribution is extremely tight, don't even bother splitting
+    if use_guard and cv_all < max_unimodal_cv:
+        return _fisher_fallback_threshold(shifts, fallback_mode, fallback_percentile)
+
+    # --- Standard Fisher grid search ---
+    candidates = np.linspace(shifts.min(), shifts.max(), n_candidates)
+    best_ratio = -1.0
+    best_tau = float(np.median(shifts))
+    best_sep_std_units = 0.0
+
+    for tau in candidates:
+        below = shifts[shifts <= tau]
+        above = shifts[shifts > tau]
+
+        if below.size < 2 or above.size < 2:
+            continue
+
+        mu_1, std_1 = below.mean(), below.std() + 1e-8
+        mu_2, std_2 = above.mean(), above.std() + 1e-8
+
+        denom = std_1**2 + std_2**2 + 1e-8
+        fisher = (mu_2 - mu_1) ** 2 / denom
+
+        if fisher > best_ratio:
+            best_ratio = fisher
+            best_tau = float(tau)
+            pooled_std = math.sqrt(denom)
+            best_sep_std_units = abs(mu_2 - mu_1) / (pooled_std + 1e-8)
+
+    # --- Guard: if best split is weak, don't use Fisher ---
+    if use_guard:
+        weak_ratio = best_ratio < min_ratio
+        weak_sep = best_sep_std_units < min_sep_std
+
+        if weak_ratio or weak_sep:
+            return _fisher_fallback_threshold(shifts, fallback_mode, fallback_percentile)
+
+    return float(best_tau)
+
+
+def _fisher_fallback_threshold(shifts, mode, percentile):
+    """
+    Conservative tau when Fisher is not trustworthy.
+    """
+    print("Fallback..")
+    shifts = np.asarray(shifts, dtype=float)
+    if mode == "mad":
+        med = float(np.median(shifts))
+        mad = float(np.median(np.abs(shifts - med))) + 1e-12
+        return med + TAU_MAD_K * mad
+    elif mode == "percentile":
+        return float(np.percentile(shifts, percentile))
+    elif mode == "max":
+        # essentially: don't flag anyone as malicious
+        return float(shifts.max() + 1e-6)
+    else:
+        # default: median
+        return float(np.median(shifts))
+
+
+
+
+
+def kde_valley_threshold(shifts, bw='scott'):
+    """
+    KDE-based valley detection threshold.
+    Fits a 1D KDE to centroid shifts and picks the first local minimum
+    between the 'honest' and 'malicious' modes. Falls back to a
+    percentile-based threshold if no valley is found.
+    """
+    from scipy.stats import gaussian_kde
+
+    shifts = np.asarray(shifts, dtype=float)
+    if shifts.size == 0:
+        return 0.0
+    if np.allclose(shifts.min(), shifts.max()):
+        # All identical -> no separation possible
+        return float(shifts[0])
+
+    kde = gaussian_kde(shifts, bw_method=bw)
+    x_eval = np.linspace(shifts.min(), shifts.max(), 1000)
+    density = kde(x_eval)
+
+    valleys = []
+    for i in range(1, len(density) - 1):
+        if density[i] < density[i - 1] and density[i] < density[i + 1]:
+            valleys.append(x_eval[i])
+
+    if valleys:
+        # First valley (closest to 'honest' region)
+        return float(valleys[0])
+    else:
+        # Fallback: moderately conservative percentile
+        return float(np.percentile(shifts, 60))
+
+
+def compute_dynamic_tau(centroid_shifts, prev_tau, rnd, total_rounds):
+    """
+    Returns a tau for this round based on TAU_MODE and the current centroid_shifts.
+
+    Supported TAU_MODE values:
+    - "percentile": tau = percentile(centroid_shifts, TAU_PERCENTILE)
+    - "mad":        tau = median + TAU_MAD_K * MAD
+    - "ema":        tau = EMA over round means of centroid_shifts
+    - "linear":     tau linearly decays from TAU_LINEAR_START to TAU_LINEAR_END
+    - "fisher":     tau from Fisher's ratio maximization (1D split)
+    - "kde":        tau from KDE valley detection
+    """
+    arr = np.asarray(centroid_shifts, dtype=float)
+
+    # Print
+    print("centroid_shifts:", centroid_shifts)
+
+    if arr.size == 0:
+        return prev_tau if prev_tau is not None else TAU  # fallback
+
+    # --- New methods ---
+    if TAU_MODE == "fisher":
+      return optimal_fisher_threshold(arr)
+
+    if TAU_MODE == "kde":
+        return kde_valley_threshold(arr)
+
+    # --- Existing methods ---
+    if TAU_MODE == "percentile":
+        return float(np.percentile(arr, TAU_PERCENTILE))
+
+    if TAU_MODE == "mad":
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med))) + 1e-12
+        return med + TAU_MAD_K * mad
+
+    if TAU_MODE == "ema":
+        mean_now = float(np.mean(arr))
+        if prev_tau is None:
+            return mean_now
+        return TAU_EMA_ALPHA * prev_tau + (1.0 - TAU_EMA_ALPHA) * mean_now
+
+    if TAU_MODE == "linear":
+        if total_rounds <= 1:
+            return TAU_LINEAR_END
+        frac = rnd / (total_rounds - 1)  # 0 -> start, 1 -> end
+        return TAU_LINEAR_START + frac * (TAU_LINEAR_END - TAU_LINEAR_START)
+
+    # default fallback
+    return TAU
+
+
+def compute_dynamic_omega(prev_reputations, prev_accept_rate, rnd, total_rounds):
+    """
+    Compute omega for this round from LAST round's reputation scores (gamma_i).
+    If none available (rnd==0), fall back to the static OMEGA.
+    Modes: percentile, target_accept, ema, linear, mad.
+    """
+    def _clip01(x): return float(max(0.0, min(1.0, x)))
+
+    if prev_reputations is None or len(prev_reputations) == 0:
+        return _clip01(OMEGA)
+
+    reps = np.asarray(prev_reputations, dtype=float)  # gamma_i in [0,1]
+
+    if OMEGA_MODE == "mad":
+        med = float(np.median(reps))
+        mad = float(np.median(np.abs(reps - med))) + 1e-12
+        omega = med + OMEGA_MAD_K * mad
+        # robust clamp to [0,1], with a little guard around the empirical range
+        lo = max(0.0, reps.min())
+        hi = min(1.0, reps.max())
+        return _clip01(np.clip(omega, lo, hi))
+
+    if OMEGA_MODE == "percentile":
+        return _clip01(np.percentile(reps, OMEGA_PERCENTILE))
+
+    if OMEGA_MODE == "target_accept":
+        n = reps.size
+        k = max(1, int(np.round(OMEGA_TARGET_ACCEPT * n)))
+        reps_sorted = np.sort(reps)[::-1]
+        thresh = reps_sorted[k-1]
+        return _clip01(thresh + 1e-4)
+
+    if OMEGA_MODE == "ema":
+        mean_rep = float(np.mean(reps))
+        base = OMEGA if rnd == 0 else None
+        if base is None:
+            return _clip01(OMEGA_EMA_ALPHA * mean_rep + (1-OMEGA_EMA_ALPHA) * OMEGA)
+        else:
+            return _clip01(OMEGA_EMA_ALPHA * base + (1-OMEGA_EMA_ALPHA) * mean_rep)
+
+    if OMEGA_MODE == "linear":
+        if total_rounds <= 1:
+            return _clip01(OMEGA_LINEAR_END)
+        frac = rnd / (total_rounds - 1)
+        return _clip01(OMEGA_LINEAR_START + frac * (OMEGA_LINEAR_END - OMEGA_LINEAR_START))
+
+    return _clip01(OMEGA)
+
